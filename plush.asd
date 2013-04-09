@@ -2,9 +2,9 @@
 
 (asdf:defsystem #:plush
   :serial t
-  :description "Describe plush here"
-  :author "Your Name <your.name@example.com>"
-  :license "Specify license here"
+  :description "sh implemented in common lisp"
+  :author "Jason Miller <aidenn0@geocities.com>"
+  :license "MIT"
   :depends-on (#:alexandria
 	       #:smug
 	       #:cl-ppcre
