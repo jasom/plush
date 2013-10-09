@@ -27,11 +27,14 @@
       (iolib/os::delocate-null-ended-list cargv))))
 ; TODO Implement special utilites
 (defparameter +shell-special-utilities+ '(("." . make-special-utility)
+					  ("umask" . make-special-utility)
 					  ("export" . make-special-utility)
+					  ("unset" . make-special-utility)
 					  ("break" . make-special-utility)
 					  ("continue" . make-special-utility)))
 ; TODO implement some utilities
-(defparameter +shell-utilities+ '(("cd" . make-utility)))
+(defparameter +shell-utilities+ '(("cd" . make-utility)
+				  ("[" . make-utility)))
 
 (defparameter +special-variables+ '(:@ :# :* :? :- :$ :! :0))
 
@@ -105,12 +108,22 @@
     (unwind-protect
 	 (case (make-keyword (car (command-words ut)))
 	   (:|cd|
-	     (if
-	      (iolib/os:directory-exists-p (second (command-words ut)))
-	      (progn
+	     (cond
+	       ((and
+		 (not (second (command-words ut)))
+		 (get-parameter "HOME")
+		 (iolib/os:directory-exists-p (get-parameter "HOME")))
+		(setf (iolib/os:current-directory) (get-parameter "HOME"))
+		0)
+	       ((not (second (command-words ut))) 127)
+	       ((iolib/os:directory-exists-p (second (command-words ut)))
 		(setf (iolib/os:current-directory) (second (command-words ut)))
 		0)
-	      127)))
+	       (t 127)))
+	   (:|[|
+	     (run-command (make-program-command "/usr/bin/[" (command-words ut)
+						(command-assignments ut)
+						(command-redirects ut)))))
       (setf (iolib/os:environment) env))))
 
 (defun dot-command (ut)
@@ -121,6 +134,51 @@
     (with-open-file (f script)
       (posix-repl :input-stream f :prompt nil))
     (se-last-returnval *current-shell-environment*)))
+
+(defun unset-command (ut)
+  (loop for var in (cdr (command-words ut))
+       do (iolib/os:makunbound-environment-variable var))
+  0)
+
+(defun symbolic-umask ()
+  (let ((umask (isys:umask 0)))
+    (isys:umask umask)
+    (apply #'format nil "u=~a,g=~a,o=~a~%"
+	   (loop for i from 6 downto 0 by 3
+	      collect (format nil "~[~;x~;w~;wx~;r~;rx~;rw~;rwx~]"
+			      (ldb (byte 3 i) (lognot umask)))))))
+
+(defun umask-command (ut)
+  (cond
+    ((not (cdr (command-words ut)))
+     (let
+	 ((realumask (isys:umask 0)))
+       (isys:umask realumask)
+       (cffi:with-foreign-string ((str len) (format nil "0~3,'0O~%" realumask))
+	 (isys:write 0 str len))))
+    ((and
+      (string= (cadr (command-words ut)) "-S")
+      (not (cddr (command-words ut))))
+     (cffi:with-foreign-string ((str len) (symbolic-umask))
+       (isys:write 0 str len)))
+    (t
+     (let ((mask
+	    (if (string= (cadr (command-words ut)) "-S")
+		(caddr (command-words ut))
+		(cadr (command-words ut)))))
+       (if (char= (char mask 0) #\0)
+	   (isys:umask (parse-integer mask :radix 8))
+	   (with-temp-fd (fd name)
+	     (let ((umask (isys:umask 0)))
+	       (isys:umask umask)
+	       (isys:fchmod fd (logand #o777 (lognot umask))))
+	     (run-command (make-program-command "/bin/chmod" `("chmod" ,mask ,name) nil nil))
+	     (isys:umask (logand #o777 (lognot (isys:stat-mode (isys:stat name))))))))
+     (when (string= (cadr (command-words ut)) "-S")
+     (cffi:with-foreign-string ((str len) (symbolic-umask))
+       (isys:write 0 str len)))))
+  0)
+	    
 
 (defun export-command (ut)
   (if (string= (second (command-words ut)) "-p")
@@ -160,6 +218,10 @@
       (export-command ut))
     (:|break|
       (throw-command ut 'break))
+    (:|unset|
+      (unset-command ut))
+    (:|umask|
+      (umask-command ut))
     (:|continue|
       (throw-command ut 'continue))))
 
@@ -223,11 +285,11 @@
 	     (logand flags (lognot isys:o-rdwr))
 	     isys:o-rdonly))
 	  (let*
-	      ((meat (second stuff))
+	      ((meat (eval (second stuff)))
 	       (meat
-		(if (string= meat (unquote meat))
-		    meat
-		    (remove-tabs meat))))
+		(if (eql op :<<-)
+		    (remove-tabs meat)
+		    meat)))
 	    (cffi:with-foreign-string ((str len) meat)
 	      (isys:write newfd str (1- len)))
 	    (isys:lseek newfd 0 isys:seek-set)))))
@@ -434,6 +496,10 @@
 (defun first-expand-word (word vas split)
   (smug:run (plush-parser::expand-word-parser vas) word))
 
+(defun expand-here-doc (doc)
+  (apply 'concatenate 'string
+  (smug:run (plush-parser::expand-here-doc-parser) doc)))
+
 (defun first-expansions (list vas split)
   (reduce #'append
 	  (mapcar (lambda (x)
@@ -577,18 +643,25 @@
 	   (nth (1- number) (se-numeric-arguments *current-shell-environment*))
 	   (iolib/os:environment-variable name))))))
 
-(defun posix-repl (&key (input-stream t)
-		     (prompt "% "))
-  (when prompt
-    (format t prompt))
-  (finish-output t)
+#|
+(defun linedit-and-parse-posix-stuff ()
   (loop
-     for expr = (read-and-parse-posix-stuff input-stream)
+       for line = (linedit:linedit :prompt "% ")
+       then (linedit:linedit :prompt "> ")
+     for sofar = (and (not (eql line :eof)) (format nil "~A~%" line))
+       then (concatenate 'string sofar (format nil "~A~%" line))
+       when (eql line :eof) return :eof
+       when (handler-case (plush-parser::parse-posix-stuff sofar)
+	       (plush-parser::eof-when-tokenizing nil)
+	       (plush-parser::posix-parse-failed nil))
+       return it))
+
+(defun posix-linedit ()
+  (loop
+     for expr = (linedit-and-parse-posix-stuff)
      until (eql expr :eof)
-     do (mapc #'eval expr)
-     when prompt
-     do  (format t prompt) and
-     do  (finish-output t)))
+     do (mapc #'eval expr)))
+|#
 
 (defun read-and-parse-posix-stuff (&optional (input t))
   (loop
@@ -600,6 +673,12 @@
 	       (plush-parser::eof-when-tokenizing nil)
 	       (plush-parser::posix-parse-failed nil))
        return it))
+
+(defun posix-repl (&key (input-stream t) &allow-other-keys)
+  (loop
+     for expr = (read-and-parse-posix-stuff input-stream)
+     until (eql expr :eof)
+     do (mapc #'eval expr)))
 
 (defun compound-command (cmd redirects)
   (setf (command-redirects cmd) redirects)
