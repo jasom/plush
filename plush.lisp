@@ -15,23 +15,43 @@
 	       (isys:unlink ,name-var))
 	    `(isys:unlink ,name-var)))))
 
+(defmacro continuable-block (&body b)
+  (with-gensyms (c)
+    `(let ((,c (catch 'continue ,@b 0)))
+       (when (> 0 ,c) (throw 'continue (1- ,c))))))
+
+(defmacro breakable-block (&body b)
+  (with-gensyms (c)
+    `(let ((,c (catch 'break ,@b 0)))
+       (when (> 0 ,c) (throw 'break (1- ,c))))))
+
 (defparameter +default-ifs+ #.(coerce '(#\Space #\Tab #\Newline) 'string))
 
-(defun lexecv (path argv)
+(defun lexecv (path argv &key (search-path nil))
   (cffi:with-foreign-object (cargv :pointer (1+ (length argv)))
     (isys:bzero cargv (* (1+ (length argv)) (isys:sizeof :pointer)))
     (unwind-protect
 	 (progn
 	   (iolib/os::allocate-argv cargv (car argv) (cdr argv))
-	   (isys:execv path cargv))
+	   (if search-path
+	       (isys:execvp path cargv)
+	       (isys:execv path cargv)))
       (iolib/os::delocate-null-ended-list cargv))))
+
 ; TODO Implement special utilites
-(defparameter +shell-special-utilities+ '(("." . make-special-utility)
+(defparameter +shell-special-utilities+ '(
+					  ("break" . make-special-utility)
+					  (":" . make-special-utility)
+					  ("continue" . make-special-utility)
+					  ("." . make-special-utility)
+					  ("eval" . make-special-utility)
+					  ("exec" . make-special-utility)
 					  ("umask" . make-special-utility)
 					  ("export" . make-special-utility)
 					  ("unset" . make-special-utility)
-					  ("break" . make-special-utility)
-					  ("continue" . make-special-utility)))
+					  ("alias" . make-special-utility)
+					  ("exit" . make-special-utility)
+					  ))
 ; TODO implement some utilities
 (defparameter +shell-utilities+ '(("cd" . make-utility)
 				  ("[" . make-utility)))
@@ -48,6 +68,7 @@
   (arg0 "" :type string)
   (toplevel-pid (isys:getpid) :type fixnum)
   (functions ():type list)
+  (aliases (make-hash-table :test #'equal) :type hash-table)
   (last-returnval 0 :type fixnum)
   (last-bg-pid nil :type (or null fixnum))
   (bg-jobs nil :type list))
@@ -99,6 +120,15 @@
 
 (defgeneric run-command (command &key subshell))
 
+(defmacro with-redirected-io ((redirects) &body b)
+  (with-gensyms (io-save)
+    `(let
+	 ((,io-save (do-redirects ,redirects t)))
+       (unwind-protect
+	    (progn
+	      ,@b)
+	      (undo-redirects ,io-save)))))
+
 ;TODO assignments and redirects
 (defmethod run-command ((ut utility) &key &allow-other-keys)
   (let ((env (iolib/os:environment)))
@@ -108,18 +138,19 @@
     (unwind-protect
 	 (case (make-keyword (car (command-words ut)))
 	   (:|cd|
-	     (cond
-	       ((and
-		 (not (second (command-words ut)))
-		 (get-parameter "HOME")
-		 (iolib/os:directory-exists-p (get-parameter "HOME")))
-		(setf (iolib/os:current-directory) (get-parameter "HOME"))
-		0)
-	       ((not (second (command-words ut))) 127)
-	       ((iolib/os:directory-exists-p (second (command-words ut)))
-		(setf (iolib/os:current-directory) (second (command-words ut)))
-		0)
-	       (t 127)))
+             (let
+               ((abspath
+                  (iolib/os:absolute-file-path
+                    (or
+                      (second (command-words ut))
+                      (get-parameter "HOME"))
+                    (iolib/os:current-directory))))
+                (handler-case
+                  (progn
+                    (setf (iolib/os:current-directory) abspath)
+                    (setf iolib/pathnames:*default-file-path-defaults* abspath)
+                    0)
+                  (iolib/syscalls:enoent (v) (declare (ignore v)) 127))))
 	   (:|[|
 	     (run-command (make-program-command "/usr/bin/[" (command-words ut)
 						(command-assignments ut)
@@ -131,9 +162,40 @@
 	 (script (if (position #\/ script)
 		     script
 		     (search-path script))))
+    (format *error-output* ". ~a~%" script)
     (with-open-file (f script)
-      (posix-repl :input-stream f :prompt nil))
+      (posix-repl :input-stream f :prompt nil :debug t))
+    (format *error-output* "DONE: ~a~%" script)
     (se-last-returnval *current-shell-environment*)))
+
+(defun quote-string (string)
+  (with-output-to-string (outs)
+    (write-char #\' outs)
+    (loop for char across string
+	 when (char= char #\')
+	 do (write-string "'\''" outs)
+	 else do (write-char char outs))
+    (write-char #\' outs)))
+
+(defun one-alias (alias)
+  (let ((pos (find-first-unquoted alias (lambda (x) (char= x #\=)))))
+    (if pos
+	(setf (gethash (subseq alias 0 pos) (se-aliases *current-shell-environment*))
+	      (subseq alias (1+ pos)))
+	(format t "alias ~a=~a~%" alias (quote-string
+					 (gethash alias (se-aliases *current-shell-environment*)))))))
+
+(defun alias-command (ut)
+  (if (cdr (command-words ut))
+      (loop for alias in (cdr (command-words ut))
+	   do (one-alias alias))
+      (loop for k being the hash-keys of (se-aliases *current-shell-environment*)
+	   using (hash-value v)
+	   do (format t "alias ~a=~a~%" k (quote-string v))))
+  0)
+
+(defun alias-substitute (word)
+  (gethash word (se-aliases *current-shell-environment*)))
 
 (defun unset-command (ut)
   (loop for var in (cdr (command-words ut))
@@ -207,23 +269,65 @@
       (parse-integer (second (command-words ut))))
      (throw tag (1- (parse-integer (Second (command-words ut))))))))
 
+(defun eval-command (ut)
+  (if (some (curry #'string/= "") (cdr (command-words ut)))
+      (progn
+	(mapc #'eval
+	      (plush-parser::parse-posix-stuff (format nil "~{~A~^ ~}" (cdr (command-words ut)))))
+	(se-last-returnval *current-shell-environment*))
+      0))
+
+(defun exit-command (ut)
+  (let ((ev (and (second (command-words ut)) (parse-integer (second (command-words ut))))))
+    (if ev
+	(isys:exit ev)
+	(isys:exit (se-last-returnval *current-shell-environment*)))))
+
+(defun exec-command (ut)
+  (handler-case
+      (prog1
+	  0
+	(lexecv (cadr (command-words ut)) (cdr (command-words ut)) :search-path t))
+    (iolib/syscalls:enoent () 127)))
+
 (defmethod run-command ((ut special-utility) &key &allow-other-keys)
   (setf (iolib/os:environment)
 	(assignments-to-env (command-assignments ut)))
   (setf (se-last-returnval *current-shell-environment*) 0)
-  (case (make-keyword (car (command-words ut)))
-    (:|.|
-      (dot-command ut))
-    (:|export|
-      (export-command ut))
-    (:|break|
-      (throw-command ut 'break))
-    (:|unset|
-      (unset-command ut))
-    (:|umask|
-      (umask-command ut))
-    (:|continue|
-      (throw-command ut 'continue))))
+  ;POSIX states that variable assignments that are part of
+  ;a special-utility command will persist.
+  ;bash disagrees (e.g. : FOO=BAR), except when invoked as "sh"
+  (let ((cmd-name (make-keyword (car (command-words ut)))))
+    (cond
+      ((and (eql cmd-name :|exec|)
+	    (= (length (command-words ut)) 1))
+       (do-redirects (command-redirects ut))
+       0)
+      (t
+       (with-redirected-io ((command-redirects ut))
+	 (case cmd-name
+	   (:|.|
+	     (dot-command ut))
+	   (:|:|
+	     0)
+	   (:|exec|
+	     (exec-command ut))
+	   (:|export|
+	     (export-command ut))
+	   (:|eval|
+	     (eval-command ut))
+	   (:|break|
+	     (throw-command ut 'break))
+	   (:|unset|
+	     (unset-command ut))
+	   (:|umask|
+	     (umask-command ut))
+	   (:|exit|
+	     (exit-command ut))
+	   (:|continue|
+	     (throw-command ut 'continue))
+	   (:|alias|
+	     (alias-command ut))))))))
 
 (defun assignments-to-env (assignments)
   (let ((env (iolib/os:environment)))
@@ -261,19 +365,24 @@
 ;TODO stub
 ;TODO respect noclobber flag
 (defun do-redirects (redirects &optional save)
-  (loop for (type op stuff fd) in redirects
-     when (null fd) do (setf fd (fd-from-op op))
+  (loop for (type op stuff fd-raw) in redirects
+     for fd = (or fd-raw (fd-from-op op))
+       for expanded-stuff =(unquote (car (first-expand-word stuff nil t)))
+     ;when (null fd) do (setf fd (fd-from-op op))
+     ;do (format t "~&FD-IN_REDIRECT: ~S ~S ~S~%" fd-raw fd op)
      when save
      collect (isys:dup fd)
      and collect fd
      end
      when (eq type :io-file)
-     do
+     do 
        (if (member op '(:<& :>&))
-	   (isys:dup2 (parse-integer stuff) fd)
-	   (let* ((fname (car (first-expand-word stuff nil t)))
-		  (fname (unquote fname))
-		  (newfd (isys:open fname (flags-from-op op))))
+	   (if (string= expanded-stuff "-")
+	       (handler-case (isys:close fd)
+		 (isys:ebadf () (values)))
+	       (isys:dup2 (parse-integer stuff) fd))
+	   (let* (
+		  (newfd (isys:open expanded-stuff (flags-from-op op))))
 	     (isys:dup2 newfd fd)
 	     (isys:close newfd)))
      else
@@ -311,32 +420,35 @@
 	(do-redirects (command-redirects command))
 	(setf (iolib/os:environment)
 	      (assignments-to-env (command-assignments command)))
-	(lexecv (program-command-path command) (command-words command))))
-    (nth-value 1
-	       (isys:waitpid pid 0))))
+        (handler-case
+          (lexecv (program-command-path command) (command-words command))
+          (iolib/syscalls:enoent () (isys:exit 127)))))
+    (let ((status (nth-value 1 (isys:waitpid pid 0))))
+      (if
+        (isys:wifexited status)
+        (isys:wexitstatus status)
+        0))))
 
 (defmethod run-command ((command function) &key subshell)
   (funcall command :subshell subshell))
-
-(defmacro with-redirected-io ((redirects) &body b)
-  (with-gensyms (io-save)
-    `(let
-	 ((,io-save (do-redirects ,redirects t)))
-       (unwind-protect
-	    (progn
-	      ,@b)
-	      (undo-redirects ,io-save)))))
 
 (defun wait-for-job (pid) ;TODO stub
   (warn "STUB: wait-for-job")
   (isys:waitpid pid 0))
 
+(defvar *path-cache* (make-hash-table :test #'equal))
+
 (defun search-path (cmd)
+  (if
+    (and (gethash cmd *path-cache*)
+         (iolib/os:file-kind (gethash cmd *path-cache*)))
+    (gethash cmd *path-cache*)
     (loop for path in
 	 (split-sequence #\: (iolib/os:environment-variable "PATH"))
 	 for cmd-path = (iolib/pathnames:merge-file-paths cmd path)
-	 when (iolib/os:file-exists-p cmd-path)
-	 return cmd-path))
+	 when (iolib/os:file-exists-p cmd-path) ;TODO check for permissions
+         do (setf (gethash cmd *path-cache*) cmd-path)
+	 and return cmd-path)))
 
 (defun set-command-environment ()
   (let ((oldenv (iolib/os:environment)))
@@ -354,6 +466,7 @@
      (lambda (&key &allow-other-keys)
        (set-vars assignments)
        0))
+    
     ((assoc (car words) +shell-special-utilities+ :test #'equal)
      (funcall (cdr (assoc (car words) +shell-special-utilities+ :test #'equal))
 	      words assignments redirects))
@@ -580,14 +693,17 @@
 	(match-one-glob directory (car parts))))))
 
 (defun expand-path (word)
-  (let* ((parts (split-quoted-path word))
-	 (parts (if
-		 (and (> (length parts) 1)
-		      (string= (plush::unquote (car parts)) ""))
-		 (cons :root (cdr parts))
-		 parts))
-	 (matches (walk-path-expansion parts)))
-    (or matches (list word))))
+  (if (equal (glob-to-pcre word)
+	     `(:sequence :start-anchor ,@(coerce word 'list) :end-anchor))
+      (list word)
+      (let* ((parts (split-quoted-path word))
+	     (parts (if
+		     (and (> (length parts) 1)
+			  (string= (plush::unquote (car parts)) ""))
+		     (cons :root (cdr parts))
+		     parts))
+	     (matches (walk-path-expansion parts)))
+	(or matches (list word)))))
 
 (defun path-expansion (list)
   (if (member #\f (se-flags *current-shell-environment*))
@@ -621,7 +737,6 @@
 		    (se-numeric-arguments *current-shell-environment*)))))
 
 (defun get-parameter (name &optional dquote)
-  (warn "STUB: get-parameter")
   (case (make-keyword name)
     (:@
      (if dquote
@@ -643,40 +758,28 @@
 	   (nth (1- number) (se-numeric-arguments *current-shell-environment*))
 	   (iolib/os:environment-variable name))))))
 
-#|
-(defun linedit-and-parse-posix-stuff ()
+(defun read-and-parse-posix-stuff (&key (input t) debug linecount)
   (loop
-       for line = (linedit:linedit :prompt "% ")
-       then (linedit:linedit :prompt "> ")
-     for sofar = (and (not (eql line :eof)) (format nil "~A~%" line))
-       then (concatenate 'string sofar (format nil "~A~%" line))
-       when (eql line :eof) return :eof
-       when (handler-case (plush-parser::parse-posix-stuff sofar)
-	       (plush-parser::eof-when-tokenizing nil)
-	       (plush-parser::posix-parse-failed nil))
-       return it))
-
-(defun posix-linedit ()
-  (loop
-     for expr = (linedit-and-parse-posix-stuff)
-     until (eql expr :eof)
-     do (mapc #'eval expr)))
-|#
-
-(defun read-and-parse-posix-stuff (&optional (input t))
-  (loop
+       for lineno from 1
        for line = (read-line input nil :eof)
      for sofar = (and (not (eql line :eof)) (format nil "~A~%" line))
        then (concatenate 'string sofar (format nil "~A~%" line))
+       when debug do (format *error-output* "~D~%" (+ lineno linecount))
        when (eql line :eof) return :eof
-       when (handler-case (plush-parser::parse-posix-stuff sofar)
-	       (plush-parser::eof-when-tokenizing nil)
-	       (plush-parser::posix-parse-failed nil))
-       return it))
+       do (let
+	      ((it (and
+		    (not (string= line ""))
+		    (not (char= (char sofar (- (length sofar) 2)) #\\))
+		    (handler-case (plush-parser::parse-posix-stuff sofar)
+			  (plush-parser::eof-when-tokenizing nil)
+			  (plush-parser::posix-parse-failed nil)))))
+	    (when it (return (values it (+ lineno linecount)))))))
 
-(defun posix-repl (&key (input-stream t) &allow-other-keys)
+(defun posix-repl (&key (input-stream t) debug &allow-other-keys)
   (loop
-     for expr = (read-and-parse-posix-stuff input-stream)
+     for lines = 0 then lines2
+     for ( expr lines2 ) = (multiple-value-list (read-and-parse-posix-stuff :input input-stream :debug debug :linecount lines))
+       when debug do (format *error-output* "~A~%" expr)
      until (eql expr :eof)
      do (mapc #'eval expr)))
 
@@ -712,6 +815,20 @@
 	(mapc #'myeval (if-command-else cmd))))
   (se-last-returnval *current-shell-environment*))
 
+
+(defclass brace-group (command)
+  ((commands :initform nil :initarg :commands :accessor brace-commands)))
+
+(defmethod run-command ((cmd brace-group) &key &allow-other-keys)
+  (with-redirected-io ((command-redirects cmd))
+    (mapc (lambda (x) (when x) (eval x))
+	    (brace-commands cmd))
+    (se-last-returnval *current-shell-environment*)))
+
+(defun brace-group (commands)
+  (make-instance 'brace-group
+		 :commands commands))
+
 (defclass for-command (command)
   ((name :initform nil
 	 :initarg :name
@@ -729,15 +846,34 @@
 		 :words words
 		 :commands commands))
 
-(defmacro continuable-block (&body b)
-  (with-gensyms (c)
-    `(let ((,c (catch 'continue ,@b 0)))
-       (when (> 0 ,c) (throw 'continue (1- ,c))))))
+(defclass while-until-command (command)
+  ((until :initform nil :initarg :until
+	  :accessor is-until)
+   (test :initform nil :initarg :test
+	 :accessor loop-test)
+   (commands :initform nil
+	    :initarg :commands
+	    :accessor loop-commands)))
 
-(defmacro breakable-block (&body b)
-  (with-gensyms (c)
-    `(let ((,c (catch 'break ,@b 0)))
-       (when (> 0 ,c) (throw 'break (1- ,c))))))
+(defun posix-while-until (test commands &optional is-until)
+  (make-instance 'while-until-command :until is-until
+		 :test test
+		 :commands commands))
+
+(defmethod run-command ((cmd while-until-command) &key &allow-other-keys)
+  (let ((result 0))
+    (with-redirected-io ((command-redirects cmd))
+      (breakable-block
+	(continuable-block
+	  (print
+	   (loop
+	      do (mapc #'eval (loop-test cmd))
+	      while (if (is-until cmd)
+			(/= 0 (se-last-returnval *current-shell-environment*))
+			(= 0 (se-last-returnval *current-shell-environment*)))
+	      do (mapc #'eval (loop-commands cmd))
+		(setf result (se-last-returnval *current-shell-environment*)))))))
+    result))
 
 (defmethod run-command ((cmd for-command) &key &allow-other-keys)
   (with-redirected-io ((command-redirects cmd))
@@ -778,3 +914,6 @@
     `(make-instance 'case-command
 		    :testme ,`(quote ,testme)
 		    :patterns ,`(quote ,patterns)))
+
+(defun get-prompt ()
+  (car (first-expand-word (get-parameter "PS1") nil nil)))
