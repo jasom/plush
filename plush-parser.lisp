@@ -951,6 +951,16 @@
     (when result
 	(values (car result)
 		(cdr result)))))
+
+(defun parse-one-command (input)
+  (let* ((source (make-token-source :parser (posix-token)
+				    :input (make-string-position-input :string input)))
+	 (parsed-input (funcall (<complete-command> nil) source)))
+    (if parsed-input
+	(destructuring-bind ((parsed . rest)) parsed-input
+	  (values parsed (spi-position (token-source-input rest))))
+	(error (make-condition 'posix-parse-failed :format-control "Failed to parse")))))
+	
   
 (defun parse-posix-stuff (input)
   (let* ((source (make-token-source :parser (posix-token)
