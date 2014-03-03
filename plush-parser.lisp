@@ -543,7 +543,7 @@
        (list (<compound-list> alias-stack))
        (_ (<close-paren>)))
     (result
-     (list 'plush::with-subshell list))))
+     (list 'plush::with-subshell '(t) list))))
 
 (defun <compound-list> (alias-stack )
   (=let*
@@ -555,7 +555,9 @@
 	      (sep (<separator>)))
 	   (result (list item sep)))))
        (last
-	(maybe (<and-or> alias-stack))))
+	(if (zerop (length stuff))
+	    (<and-or> alias-stack)
+	    (maybe (<and-or> alias-stack)))))
     (result
      (convert-maybe-async-list
       (if last
