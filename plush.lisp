@@ -46,14 +46,15 @@
 					  ("." . make-special-utility)
 					  ("eval" . make-special-utility)
 					  ("exec" . make-special-utility)
-					  ("umask" . make-special-utility)
 					  ("export" . make-special-utility)
 					  ("unset" . make-special-utility)
-					  ("alias" . make-special-utility)
+					  ("return" . make-special-utility)
 					  ("exit" . make-special-utility)
 					  ))
 ; TODO implement some utilities
 (defparameter +shell-utilities+ '(("cd" . make-utility)
+				  ("umask" . make-utility)
+				  ("alias" . make-utility)
 				  ("[" . make-utility)))
 
 (defparameter +special-variables+ '(:@ :# :* :? :- :$ :! :0))
@@ -137,6 +138,8 @@
 	  (assignments-to-env (command-assignments ut)))
     (unwind-protect
 	 (case (make-keyword (car (command-words ut)))
+	   (:|alias|
+	     (alias-command ut))
 	   (:|cd|
              (let
                ((abspath
@@ -151,21 +154,31 @@
                     (setf iolib/pathnames:*default-file-path-defaults* abspath)
                     0)
                   (iolib/syscalls:enoent (v) (declare (ignore v)) 127))))
+	   (:|umask|
+	     (umask-command ut))
 	   (:|[|
 	     (run-command (make-program-command "/usr/bin/[" (command-words ut)
 						(command-assignments ut)
 						(command-redirects ut)))))
       (setf (iolib/os:environment) env))))
 
+(defun return-command (ut)
+  (when (second (command-words ut))
+    (setf (se-last-returnval *current-shell-environment*)
+	  (or (parse-integer (Second (command-words ut)) :junk-allowed t)
+	      255))
+    (throw 'plush-return (se-last-returnval *current-shell-environment*))))
+				 
 (defun dot-command (ut)
   (let* ((script (second (command-words ut)))
 	 (script (if (position #\/ script)
 		     script
 		     (search-path script))))
     (format *error-output* ". ~a~%" script)
-    (with-open-file (f script)
-      (posix-repl :input-stream f :prompt nil :debug t))
-    (format *error-output* "DONE: ~a~%" script)
+    (catch 'plush-return
+      (with-open-file (f script)
+	(posix-repl :input-stream f :prompt nil :debug t))
+      (format *error-output* "DONE: ~a~%" script))
     (se-last-returnval *current-shell-environment*)))
 
 (defun quote-string (string)
@@ -306,28 +319,27 @@
       (t
        (with-redirected-io ((command-redirects ut))
 	 (case cmd-name
-	   (:|.|
-	     (dot-command ut))
-	   (:|:|
-	     0)
-	   (:|exec|
-	     (exec-command ut))
-	   (:|export|
-	     (export-command ut))
-	   (:|eval|
-	     (eval-command ut))
 	   (:|break|
 	     (throw-command ut 'break))
-	   (:|unset|
-	     (unset-command ut))
-	   (:|umask|
-	     (umask-command ut))
-	   (:|exit|
-	     (exit-command ut))
+	   (:|:|
+	     0)
 	   (:|continue|
 	     (throw-command ut 'continue))
-	   (:|alias|
-	     (alias-command ut))))))))
+	   (:|.|
+	     (dot-command ut))
+	   (:|eval|
+	     (eval-command ut))
+	   (:|exec|
+	     (exec-command ut))
+	   (:|exit|
+	     (exit-command ut))
+	   (:|export|
+	     (export-command ut))
+	   (:|return|
+	     (return-command ut))
+	   (:|unset|
+	     (unset-command ut))
+	   ))))))
 
 (defun assignments-to-env (assignments)
   (let ((env (iolib/os:environment)))
