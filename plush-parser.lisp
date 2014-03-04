@@ -699,7 +699,7 @@
        (_ (<linebreak>))
        (body (tracer "FBODY" (<compound-command> alias-stack)))
        (redirect (maybe (<redirect-list>))))
-    (result (list :fdef fname body redirect))))
+    (result `(plush::define-function ,(second fname) ',body ',redirect))))
 
 (defun <brace-group> (alias-stack)
   (=let*

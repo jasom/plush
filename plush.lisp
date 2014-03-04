@@ -68,7 +68,7 @@
   (numeric-arguments () :type list)
   (arg0 "" :type string)
   (toplevel-pid (isys:getpid) :type fixnum)
-  (functions ():type list)
+  (functions (make-hash-table :test #'equal) :type hash-table)
   (aliases (make-hash-table :test #'equal) :type hash-table)
   (last-returnval 0 :type fixnum)
   (last-bg-pid nil :type (or null fixnum))
@@ -118,6 +118,18 @@
 		 :words argv
 		 :assignments assignments
 		 :redirects redirects))
+
+(defclass function-command (command)
+ ((fn :initarg :fn)
+  (internal-redirects :initarg :internal-redirects)))
+
+(defun make-function-command (fn words assignments redirects)
+  (make-instance 'function-command
+		 :fn (car fn)
+		 :internal-redirects (cdr fn)
+		 :redirects redirects
+		 :words words
+		 :assignments assignments))
 
 (defgeneric run-command (command &key subshell))
 
@@ -444,6 +456,21 @@
 (defmethod run-command ((command function) &key subshell)
   (funcall command :subshell subshell))
 
+(defmethod run-command ((command function-command) &key &allow-other-keys)
+  (with-redirected-io ((command-redirects command))
+    (with-redirected-io ((slot-value command 'internal-redirects))
+     (let ((env-save (iolib/os:environment)))
+       (unwind-protect
+	    (progn
+	      (setf (iolib/os:environment)
+		    (assignments-to-env (command-assignments command)))
+	      (catch 'plush-return
+		(run-pipe (eval (slot-value command 'fn))))
+	      (se-last-returnval *current-shell-environment*))
+	 (setf (iolib/os:environment) env-save))))))
+
+
+
 (defun wait-for-job (pid) ;TODO stub
   (warn "STUB: wait-for-job")
   (isys:waitpid pid 0))
@@ -482,9 +509,10 @@
     ((assoc (car words) +shell-special-utilities+ :test #'equal)
      (funcall (cdr (assoc (car words) +shell-special-utilities+ :test #'equal))
 	      words assignments redirects))
-    ((assoc (car words) (se-functions *current-shell-environment*))
-     (funcall (cdr (assoc (car words) (se-functions *current-shell-environment*)))
-	      words assignments redirects))
+    ((gethash (car words) (se-functions *current-shell-environment*))
+     (make-function-command
+      (gethash (car words) (se-functions *current-shell-environment*))
+      words assignments redirects))
     ((assoc (car words) +shell-utilities+ :test #'equal)
      (funcall (cdr (assoc (car words) +shell-utilities+ :test #'equal))
 	      words assignments redirects))
@@ -929,3 +957,8 @@
 
 (defun get-prompt ()
   (car (first-expand-word (get-parameter "PS1") nil nil)))
+
+(defun define-function (fname command redirects)
+  (setf (gethash fname (se-functions *current-shell-environment*))
+	(cons command redirects))
+  (make-special-utility '(":") nil nil))
