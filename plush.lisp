@@ -52,9 +52,24 @@
 					  ("exit" . make-special-utility)
 					  ))
 ; TODO implement some utilities
-(defparameter +shell-utilities+ '(("cd" . make-utility)
-				  ("umask" . make-utility)
+(defparameter +shell-utilities+ '(
 				  ("alias" . make-utility)
+				  ;bg
+				  ("cd" . make-utility)
+				  ;command
+				  ;false
+				  ;fc
+				  ;fg
+				  ;getopts
+				  ("jobs" . make-utility)
+				  ;kill
+				  ;newgrp
+				  ;pwd
+				  ;read
+				  ;true
+				  ("umask" . make-utility)
+				  ;unalias
+				  ;wait
 				  ("[" . make-utility)))
 
 (defparameter +special-variables+ '(:@ :# :* :? :- :$ :! :0))
@@ -142,6 +157,12 @@
 	      ,@b)
 	      (undo-redirects ,io-save)))))
 
+(defun jobs-command (ut)
+  ;TODO add -l and -p support
+  (loop for item in (se-bg-jobs *current-shell-environment*)
+       do (format t "~A~%" item))
+  0)
+
 ;TODO assignments and redirects
 (defmethod run-command ((ut utility) &key &allow-other-keys)
   (let ((env (iolib/os:environment)))
@@ -166,6 +187,8 @@
                     (setf iolib/pathnames:*default-file-path-defaults* abspath)
                     0)
                   (iolib/syscalls:enoent (v) (declare (ignore v)) 127))))
+	   (:|jobs|
+	     (jobs-command ut))
 	   (:|umask|
 	     (umask-command ut))
 	   (:|[|
