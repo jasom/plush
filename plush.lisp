@@ -670,7 +670,10 @@
      finally (return nil)))
 
 (defun first-expand-word (word vas split)
-  (smug:run (plush-parser::expand-word-parser vas) word))
+  (esrap::parse (if vas
+		    'plush-token::expand-word-parser-assignment
+		    'plush-token::expand-word-parser) word))
+  ;(smug:run (plush-parser::expand-word-parser vas) word))
 
 (defun expand-here-doc (doc)
   (apply 'concatenate 'string
@@ -708,7 +711,8 @@
 
 
 (defun glob-to-pcre (glob)
-  (caar (funcall (plush-parser::glob-parser) glob)))
+  (esrap::parse 'plush-token::glob-parser glob))
+  ;(caar (funcall (plush-parser::glob-parser) glob)))
 
 (defun match-one-glob (directory glob)
   (let* ((starts-with-dot
@@ -756,8 +760,13 @@
 	(match-one-glob directory (car parts))))))
 
 (defun expand-path (word)
-  (if (equal (glob-to-pcre word)
-	     `(:sequence :start-anchor ,@(coerce word 'list) :end-anchor))
+  (if (not
+       (member-if-not (lambda (x)
+			(or (characterp x)
+			    (eql x :sequence)
+			    (eql x :start-anchor)
+			    (eql x :end-anchor)))
+		  (flatten (glob-to-pcre word))))
       (list word)
       (let* ((parts (split-quoted-path word))
 	     (parts (if
@@ -834,7 +843,7 @@
 		    (not (string= line ""))
 		    (not (char= (char sofar (- (length sofar) 2)) #\\))
 		    (handler-case (plush-parser::parse-posix-stuff sofar)
-			  (plush-parser::eof-when-tokenizing nil)
+		      (plush-token::eof-when-tokenizing nil)
 			  (plush-parser::posix-parse-failed nil)))))
 	    (when it (return (values it (+ lineno linecount)))))))
 
@@ -844,7 +853,9 @@
      for ( expr lines2 ) = (multiple-value-list (read-and-parse-posix-stuff :input input-stream :debug debug :linecount lines))
        when debug do (format *error-output* "~A~%" expr)
      until (eql expr :eof)
-     do (mapc #'eval expr)))
+     do (restart-case
+	    (mapc #'eval expr)
+	  (plush-continue nil))))
 
 (defun compound-command (cmd redirects)
   (setf (command-redirects cmd) redirects)

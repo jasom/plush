@@ -6,7 +6,8 @@
   :author "Jason Miller <aidenn0@geocities.com>"
   :license "MIT"
   :depends-on (#:alexandria
-	       #:smug
+	       #:esrap
+               #:smug
 	       #:cl-ppcre
                #:split-sequence
                #:iolib/syscalls

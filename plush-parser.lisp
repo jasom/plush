@@ -1,979 +1,328 @@
-(in-package :plush-parser)
+(in-package :plush-token)
 
 (declaim (optimize (debug 3)))
 
-(defparameter +reserved-words+ '("if" "then" "else" "elif" "fi" "do" "done" "in"
-				 "case" "esac" "while" "until" "for" "{" "}" "!"))
-
 (define-condition eof-when-tokenizing (simple-error) ())
 
-(define-condition posix-parse-failed (simple-error) ())
 
-(defparameter *newline-skip* 0)
+(defparameter *newline-skip* 0
+  "Number of characters to skip when next newline is encountered
 
-(defun eof-token ()
-  (=let* ((_ (=not (item))))
-    (result (list :eof))))
+This must be reinitilized to the fifth value of the token list when
+retokenizing (e.g. after an alias is expanded))
 
-(defun peek (parser)
-  (lambda (input)
-    (mapcar (lambda (x) (cons (car x) input))
-	    (funcall parser input))))
+To see why,consider:
 
-(defstruct (string-position-input (:conc-name spi-))
-  (string "" :type string)
-  (position 0 :type fixnum))
+    foo <<EOF; someAlias <<EOF
+    a
+    EOF
+    b
+    EOF
 
-(defmethod one-lisp-form-internal ((input string-position-input))
+someAlias will tokenize as (:token \"someAlias\" 11 19 5) since we
+need to skip 5 characters to consume the first here document.  So when
+we alias expand someAlias and restart the tokenizing from there, it is necessary to set *newline-skip* to 5")
+
+
+(defrule eof-token 
+         (! character)
+         (:constant (list :eof)))
+
+(defun one-lisp-form (input start end)
   (let* ((end
-	  (handler-case
-	      (nth-value 1
-			 (read-from-string (spi-string input) t nil
-					   :start (spi-position input)))
-	    (error () (error
+           (handler-case
+             (nth-value 1 (read-from-string input t nil :start start :end end))
+             (error () (error
 		       (make-condition 'eof-when-tokenizing :format-control "EOF in lisp-form"))))))
-    (list (cons (coerce (subseq (spi-string input)
-				(spi-position input) end) 'list)
-		(make-string-position-input :string (spi-string input)
-					    :position end)))))
+    (values (subseq input start end) end t)))
 
-(defmethod one-lisp-form-internal ((input string))
-  (let* ((end
-	  (handler-case
-	      (nth-value 1 (read-from-string input))
-	    (error () (error
-		       (make-condition 'eof-when-tokenizing :format-control "EOF in lisp-form"))))))
-    (list (cons (coerce (subseq input 0 end) 'list)
-		(subseq input end)))))
+(defun not-newline (char)
+  (char/= #\Newline char))
 
-(defun one-lisp-form ()
-  #'one-lisp-form-internal)
 
+
+;TODO esrap set newline-=skip
+(defun here-doc-internal (input start end)
+  ;(format t "HDI: ~a ~a ~a~%" input start end)
+  (multiple-value-bind (word word-end info)
+    (esrap:parse 'posix-word input :start start :end end :junk-allowed t)
+      (declare (ignorable info))
+    ;(format t "HDI: ~a ~a ~a~%" word word-end info)
+    (if (= word-end start)
+      (values nil nil "Error parsing here-doc")
+      (multiple-value-bind
+	    (doc newend success)
+	     (esrap:parse
+	      `(and
+		(* (and (! #\Newline) character))
+		#\Newline
+		(string ,*newline-skip*)
+		(*
+		 (and
+		  (! ,(concatenate 'string
+				  '(#\Newline)
+				  (second word)))
+		  character))
+		,(concatenate 'string
+			      '(#\Newline)
+			      (second word)))
+	      input
+	      :start word-end :end end :junk-allowed t)
+	(declare (ignore newend) (type))
+	;(format t "HDI: ~a ~a ~a~%" doc newend success)
+	(if (not (eql t success))
+	    (values nil nil "Error parsing here-doc")
+	    (let ((text (text (nthcdr 3 doc))))
+	      (incf *newline-skip* (length text))
+	      (values (list :here-doc (subseq text 0 (- (length text) (length word)))) end t))))
+	  )))
+
+    
 ;This has a side-effect and so relies on not-backtracking
 ;Since operators are unambiguous that should be fine
-(defun here-doc-internal ()
-  (=let*
-      ((word (posix-word)))
-    (=or
-     (=let*
-	 ((_ (zero-or-more
-	      (=satisfies (curry #'char/= #\Newline))))
-	  (_ (exactly *newline-skip* (item))))
-       (let* ((word (plush::unquote (second word)))
-	      (terminator (format nil "~C~A~C" #\Newline word #\Newline)))
-	 (tracer (format nil "HDI ~A" word)
-		 (=let*
-		     ((stuff
-		       (zero-or-more
-			(=and
-			 (=not (=string terminator))
-			 (item))))
-		      (_ (=string terminator)))
-		   (result
-		    (progn
-		      ;(format t "Newline-skip == ~S~%" *newline-skip*)
-		      (incf *newline-skip*
-			    (1- (+ (length stuff) (length terminator))))
-		      ;(format t "Newline-skip <- ~S~%" *newline-skip*)
-		      (list :here-doc
-			    (if stuff
-				(coerce
-				 (append (cdr stuff) (list (car stuff))) 'string)
-				""))))))))
-     (=let* ((_ (result t)))
-      (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for ~A"
-			     :format-arguments (cdr word)))))))
-
-(defun here-doc-reader ()
-   (peek
-    (here-doc-internal)))
-
-(defun here-doc-op ()
-  (tracer "HDO"
-  (=let*
-      ((operator
-	(=or
-	 (=string "<<-")
-	 (=string "<<")))
-       (doc (maybe (here-doc-reader))))
-    (result
-     (list (make-keyword operator) operator doc)))))
-
-(defun operator-start ()
-  (=or
-   (=satisfies (rcurry #'position "|&;<>()"))))
-  
-(defun operator-token ()
-  (=or
-   (here-doc-op)
-   (=let*
-       ((operator
-	 (=or
-	  (=string "&&")
-	  (=string "||")
-	  (=string ";;")
-	  (=string ">>")
-	  (=string "<&")
-	  (=string ">&")
-	  (=string "<>")
-	  (=satisfies (rcurry #'position "|&;<>()"))
-	  )))
-     (result
-      (list (make-keyword operator) operator)))))
-
-(defun line-comment ()
-  (=and (=char #\#)
-	(zero-or-more
-	 (=satisfies
-	  (lambda (x) (char/= #\Newline x))))))
-
-(defun newline-token ()
-  (=let* ((_ (=char #\Newline))
-	  (_ (exactly *newline-skip* (item))))
-    (result
-     (progn
-       (setf *newline-skip* 0)
-       ;(format t "Newline-skip <- ~S~%" *newline-skip*)
-    (list :newline #.(make-string 1 :initial-element #\Newline))))))
-
-(defun io-number ()
-  (=let* ((num (string-of (one-or-more (=satisfies #'digit-char-p))))
-	  (_ (=not (=not (=or (=char #\<) (=char #\>))))))
-    (result (list :io-number num))))
-
-(defun blank-character ()
-  ;TODO Locale stuff, right now everything is POSIX locale
-  (=or
-   (=char #\Space)
-   ;(=char #\Newline) Newlines are special in the tokenizer
-   (=char #\Page)
-   (=char #\Return)
-   (=char #\Tab)
-   (=char #\Vt)
-   (=and (=char #\\)
-	 (=char #\Newline))))
-
-(defun backslash-quote ()
-  (=let*
-      ((_ (=char #\\))
-       (c (item)))
-    (result
-     (when (char/= c #\Newline)
-       (format nil "\\~C" c)))))
-
-(defun double-quoted-meat ()
-  (=and
-   (=char #\")
-   (=or
-    (=let*
-	((stuff
-	  (zero-or-more
-	   (=and
-	    (=not (=char #\"))
-	    (=or
-	     (backslash-quote)
-	     (arithmetic-expansion)
-	     (command-substitution)
-	     (parameter-expansion)
-	     (item)))))
-	 (_ (=char #\")))
-      (result (format nil "\"~{~A~}\"" stuff)))
-    (=let* ((_ (result t)))
-      (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for \""))))))
-
-(defun single-quoted-meat ()
-  (=and
-   (=char #\')
-   (=or
-    (=let*
-	((stuff
-	  (string-of
-	   (zero-or-more
-	    (=satisfies (curry #'char/= #\')))))
-	 (_ (=char #\')))
-      (result (format nil "'~A'" stuff)))
-    (=let* ((_ (result t)))
-      (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for '"))))))
-
-(defun parenthesized-expression (parser)
-  (=let*
-      ((_ (=char #\())
-       (stuff (zero-or-more
-	       (=and (=not (=char #\)))
-		     parser)))
-       (_ (=char #\))))
-    (result (format nil "(~{~A~})" stuff))))
-	  
-(defun lisp-expansion ()
-  (=let*
-      ((_ (=string "$["))
-       (stuff
-	(tracer "l-e"
-	(one-lisp-form)))
-       (_ (=string "]")))
-    (result
-     (format nil "$[~{~A~}]" stuff))))
-	
-(defun arithmetic-expansion ()
-  (=let*
-   ((_ (=string "$(("))
-    (stuff
-     (zero-or-more
-      (=and
-       (=not (=string "))"))
-       (token-string-until-unbalanced-paren))))
-       (_ (=string "))")))
-    (result
-     (format nil "$((~{~A~}))" stuff))))
-
-(defun command-substitution ()
-  (=or
-   (=let*
-       ((_ (=char #\`))
-	(stuff
-	 (zero-or-more
-	  (=or
-	   (=and
-	    (=char #\\)
-	    (=or
-	     (=and (=char #\$) (result "\$"))
-	     (=and (=char #\`) (result "\`"))
-	     (=and (=char #\\) (result "\\"))
-	     (result #\\)))
-	   (=satisfies (curry #'char/= #\`)))))
-	(_ (=char #\`)))
-     (result (format nil "`~{~A~}`" stuff)))
-   (=let*
-       ((_ (=string "$("))
-	(tokens
-	 (token-string-until-unbalanced-paren))
-	(_ (=string ")")))
-     (result 
-     (format nil "$(~A)" tokens)))))
-	 
-(defun token-or-pair (start end)
-  (=let*
-      ((much-stuff
-	(zero-or-more
-	 (tracer "much-stuff"
-	 (=or
-	  (=let* ((_ (=not (item))))
-	    (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for ~A" :format-arguments (list end))))
-	  (=and
-	   (=not (=char end))
-	   (=or
-	    (=let*
-		((_ (=char start))
-		 (stuff
-		  (tracer "STUFF"
-		  (token-or-pair start end)))
-		 (_ (=char end)))
-	      (if stuff
-		  (result (format nil "~C~A~C" start stuff end))
-		  (result (coerce (list start end) 'string))))
-	    (token-meat)
-	    (item))))))))
-    (result 
-    (apply #'concatenate 'string (mapcar #'string much-stuff)))))
-
-(defun token-string-until-unbalanced-brace ()
-  (token-or-pair #\{ #\}))
- 
-(defun token-string-until-unbalanced-paren ()
-  (token-or-pair #\( #\)))
-
-(defun posix-name ()
-  (=let*
-      ((first-char (=satisfies (rcurry #'position "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")))
-       (more-chars
-	(zero-or-more
-	 (=satisfies
-	  (rcurry #'position "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_1234567890")))))
-    (result (cons first-char more-chars))))
-    
-#+(or)(defun tracer (string parser)
-  (lambda (input)
-    (format t "~A: ~S~%" string input)
-    (let ((result (funcall parser input)))
-      (format t "~A=>: ~S~%" string result)
-      result)))
-#-(or)(defun tracer (string parser)
-  (declare (ignore string))
-  parser)
-
-(defun parameter-expansion ()
-  (=and
-   (=char #\$)
-   (=or
-    (=let*
-	((_ (=char #\{))
-	 (stuff
-	   (token-string-until-unbalanced-brace))
-	 (_ (=char #\})))
-      (result (format nil "${~A}" stuff)))
-    (=let*
-	((name (string-of (posix-name))))
-      (result (format nil "$~A" name)))
-    (=let*
-	((char (item)))
-      (result (format nil "$~C" char))))))
-
-
-(defun token-meat ()
-  "Parser for everything that isn't eof, operator, io-number or newline"
-  (=and
-      (=not (tracer "NOTOT" (operator-start)))
-      (=not (eof-token))
-      (=not (=char #\Newline))
-      (=not (blank-character))
-      (=or
-	(backslash-quote)
-	(double-quoted-meat)
-	(single-quoted-meat)
-	(lisp-expansion)
-	(arithmetic-expansion)
-	(command-substitution)
-	(parameter-expansion)
-	(=let* ((item (item))) (result (coerce (list item) 'string))))))
-
-(defun token-string ()
-  (=let*
-      ((continuation1
-	(zero-or-more (=and (=char #\\) (=char #\Newline)
-			    (result #.(coerce '(#\\ #\Newline) 'string)))))
-       (blanks (string-of (zero-or-more (blank-character))))
-       (continuation2
-	(zero-or-more (=and (=char #\\) (=char #\Newline)
-			    (result #.(coerce '(#\\ #\Newline) 'string)))))
-       (token (tracer "TSPT" (posix-token))))
-    (result
-     (format nil "~{~A~}~A~{~A~}~A"
-	     continuation1
-	     blanks
-	     continuation2
-	     (second token)))))
-
-(defun posix-word ()
-  (=let* ((meat (one-or-more (token-meat))))
-    (result (list :token (apply #'concatenate 'string meat)))))
-
-(defun token-boundaries (parser)
-  (lambda (input)
-    (let ((start (spi-position input)))
-      (loop for
-	   (result . rest) in (funcall parser input)
-	   collect
-	   (cons
-	    (append result
-		    (list start
-			  (spi-position rest)))
-	    rest)))))
-
-(defun posix-token ()
-  (tracer "PT"
-  (=and
-   (zero-or-more (blank-character))
-   (zero-or-more (line-comment))
-   (token-boundaries
-   (=or
-    (operator-token)
-    (io-number)
-    (tracer "NEWLINE"
-	    (newline-token))
-    (eof-token)
-    (posix-word))))))
-     
-
-(defmethod smug::input-first ((input string-position-input))
-  (char (spi-string input) (spi-position input)))
-
-(defmethod smug::input-rest ((input string-position-input))
-  (make-string-position-input :string (spi-string input)
-			      :position (1+ (spi-position input))))
-
-(defmethod smug::input-empty-p ((input string-position-input))
-  (= (spi-position input) (length (spi-string input))))
-
-;This needs to be line cached because our
-;Tokenizer includes side-effects that disallows backtracking within a line
-(defstruct token-source
-  (parser (constantly nil) :type function)
-  (line-cache nil :type list)
-  (input ""))
-
-(defun line-cache-fill (input)
-  (when (null (token-source-line-cache input))
-    (setf (token-source-line-cache input)
-	  (loop for (result) = (funcall (token-source-parser input)
-					(token-source-input input))
-	     collect (car result)
-	     do (setf (token-source-input input) (cdr result))
-	     while (and
-		    (not (eql (caar result) :eof))
-		     (not (eql (caar result) :newline))))))
-  (token-source-line-cache input))
-
-(defmethod smug::input-first ((input token-source))
-  (let
-      ((line-cache (line-cache-fill input)))
-    (car line-cache)))
-
-(defmethod smug::input-rest ((input token-source))
-  (let
-      ((line-cache (line-cache-fill input)))
-    (make-token-source
-     :parser (token-source-parser input)
-     :line-cache (cdr line-cache)
-     :input (token-source-input input))))
-
-(defmethod smug::input-empty-p ((input token-source))
-  (let
-      ((line-cache (line-cache-fill input)))
-  (eql :eof (caar line-cache))))
-
-(defun convert-maybe-async-list (list)
-  (loop for (cmd op . rest) = list then rest
-       while cmd
-       if (eql (car op) :&)
-       collect (list 'plush::asynchronous-cmd cmd)
-       else collect cmd))
-   
-(defun <complete-command> (alias-stack)
-  (=or
-   (=not (item))
-   (=satisfies (lambda (x) (and (consp x) (eql (car x) :eof))))
-   (=let* ((_ (<newline-list>)))
-     (result
-      '(())))
-   (=let*
-	((list (<list> alias-stack))
-	(op (maybe (<separator>))))
-     (let
-	 ((fixed-list (append list (list op))))
-       (result
-	(convert-maybe-async-list fixed-list))))))
-
-(defun collect-list-and-separators (list-sep last)
-  (loop for list = list-sep then (cdr list)
-       when list
-       append (car list)
-       else collect last
-       while list))
-
-(defun <list> (alias-stack)
-  (=let*
-      ((first (<and-or> alias-stack))
-       (rest
-	(zero-or-more
-	 (=let* ((op (<separator-op>))
-		 (andor (<and-or> alias-stack)))
-	   (result (list op andor))))))
-    (result (cons first (reduce #'append rest)))))
-
-(defun <and-or> (alias-stack)
-  (=let*
-      ((conditionals
-	(zero-or-more
-	 (=let*
-	     ((pipe (<pipeline> alias-stack))
-	      (op
-	       (=or (<and-if>)
-		    (<or-if>)))
-	      (_ (<linebreak>)))
-	   (result
-	    (list pipe op)))))
-       (last (<pipeline> alias-stack)))
-    (result
-     (reduce (lambda (x y)
-	       (destructuring-bind (pipe op) x
-		 (if
-		  (eql (car op) :&&)
-		       (list 'plush::shell-and pipe y)
-		       (list 'plush::shell-or pipe y))))
-		  conditionals
-	       :from-end t :initial-value last))))
-
-(defun <pipeline> (alias-stack)
-    (=let*
-	((bang (maybe (rword :!)))
-	 (sequence (<pipe-sequence> alias-stack)))
-      (result
-       (if bang
-	   `(plush::invert-result ,sequence)
-	   sequence))))
-
-(defun <pipe-sequence> (alias-stack)
-  (=let*
-      ((stuff
-	(zero-or-more
-	 (=prog1
-	  (<command> alias-stack)
-	  (<vbar>)
-	  (<linebreak>))))
-       (last (<command> alias-stack)))
-    (result
-     `(plush::run-pipe
-	     ,@stuff
-	     ,last))))
-
-(defun <command> (alias-stack)
-  (=or
-   (<function-definition> alias-stack)
-   (<simple-command> alias-stack)
-   (=let*
-       ((cmd (<compound-command> alias-stack))
-	(redir (maybe (<redirect-list>))))
-     (result `(plush::compound-command ,cmd ',redir)))))
-
-(defun <compound-command> (alias-stack)
-  (=let*
-      ((cmd
-	(=or (<brace-group> alias-stack)
-	     (<subshell> alias-stack)
-	     (<for-clause> alias-stack)
-	     (<case-clause> alias-stack)
-	     (<if-clause> alias-stack)
-	     (<while-until-clause> alias-stack))))
-    (result
-     cmd)))
-
-(defun <subshell> (alias-stack)
-  (=let*
-      ((_ (<open-paren>))
-       (list (<compound-list> alias-stack))
-       (_ (<close-paren>)))
-    (result
-     (list 'plush::with-subshell '(t) list))))
-
-(defun <compound-list> (alias-stack )
-  (=let*
-      ((_ (maybe (<newline-list>)))
-       (stuff
-	(zero-or-more
-	 (=let*
-	     ((item (<and-or> alias-stack))
-	      (sep (<separator>)))
-	   (result (list item sep)))))
-       (last
-	(if (zerop (length stuff))
-	    (<and-or> alias-stack)
-	    (maybe (<and-or> alias-stack)))))
-    (result
-     (convert-maybe-async-list
-      (if last
-	  (collect-list-and-separators stuff last)
-	  (mapcan #'copy-list stuff))))))
-
-(defun <for-clause> (alias-stack)
-  (=let*
-      ((_ (rword :for))
-       (name (<name>))
-       (_ (<linebreak>))
-       (in (maybe (rword :in)))
-       (wordlist
-	(if in
-	    (maybe (<wordlist>))
-	    (result nil)))
-       (_ (if in (<sequential-sep>)
-	      (result t)))
-       (do-group (<do-group> alias-stack)))
-    (let
-	((wordlist (if in wordlist '("$@"))))
-      (result
-       `(plush::posix-for ,(second name) (plush::expand-word-list ,`(quote ,wordlist)) ,`(quote ,do-group))))))
-
-(defun <name> ()
-  (=let*
-   ((name (=satisfies (lambda (x)
-			(and (eql :token (car x))
-			(smug:run (posix-name) (second x)))))))
-    (result (list :name (second name)))))
-
-
-(defun <wordlist> ()
-  (=let* ((words (one-or-more (<word>))))
-    (result (mapcar #'second words))))
-
-(defun <word> (&optional disallowed-rsvd alias-mode)
-  (=let*
-      ((word (=satisfies (compose (curry #'eql :token) #'car))))
-    (if
-     (member (second word) disallowed-rsvd :test #'string=)
-     (fail)
-     (result (if alias-mode
-		 word
-		 (list :word (second word)))))))
-
-(defun <case-clause> ( alias-stack)
-  (=let*
-      ((_ (rword :case))
-       (word (<word>))
-       (_ (<linebreak>))
-       (_ (rword :in))
-       (_ (<linebreak>))
-       (stuff
-	(zero-or-more
-	 (=let*
-	     ((_ (maybe (op #\()))
-	      (pattern (<pattern>))
-	      (_ (op #\)))
-	      (meat (=or
-		     (<compound-list> alias-stack)
-		     (<linebreak>)))
-	      (_ (op ";;"))
-	      (_ (<linebreak>)))
-	   (result (list pattern meat)))))
-       (last
-	(maybe
-	 (=let*
-	     ((_ (maybe (op #\()))
-	      (pattern (<pattern>))
-	      (_ (op #\)))
-	      (meat (maybe (<compound-list> alias-stack)))
-	      (_ (<linebreak>)))
-	   (result (list pattern meat)))))
-       (_ (rword :esac)))
-    (result
-     `(plush::posix-case ,(second word) ,@stuff ,@(when last `(,last))))))
-
-(defun <pattern> ()
-  (=let*
-      ((_ (=not (rword :esac)))
-       (first (<word>))
-       (rest
-	(zero-or-more
-	 (=and
-	  (op "|")
-	  (<word>)))))
-    (result
-     (mapcar #'second (cons first rest)))))
-
-(defun <if-clause> (alias-stack)
-  (=let*
-      ((_ (rword :if))
-       (if-part (<compound-list> alias-stack))
-       (_ (rword :then))
-       (then-part (<compound-list> alias-stack))
-       (else-part (<else-part> alias-stack))
-       (_ (rword :fi)))
-    (result `(plush::posix-if ,`(quote ,if-part)
-			      ,`(quote ,then-part)
-			      ,`(quote ,else-part)))))
-
-(defun <else-part> (alias-stack)
-  (=or
-   (=let*
-       ((_ (rword :elif))
-	(elif-part (<compound-list> alias-stack))
-	(_ (rword :then))
-	(then-part (<compound-list> alias-stack))
-	(else-part (<else-part> alias-stack)))
-     (result `((plush::run-pipe
-		(plush::posix-if ,`(quote ,elif-part)
-			       ,`(quote ,then-part)
-			       ,`(quote ,else-part))))))
-   (=let*
-       ((else
-	 (maybe
-	  (=and
-	   (rword :else)
-	   (<compound-list> alias-stack)))))
-     (result 
-      else))))
-
-(defun <while-until-clause> (alias-stack)
-  (=let*
-      ((type
-	(=or
-	 (rword :while)
-	 (rword :until)))
-       (while (<compound-list> alias-stack))
-       (do (<do-group> alias-stack)))
-    (result `(plush::posix-while-until ,`',while ,`',do ,(eql type :until)))))
-
-(defun <function-definition> (alias-stack)
-  (=let*
-      ((fname (tracer "FNAME" (<name>)))
-       (_ (op "("))
-       (_ (op ")"))
-       (_ (<linebreak>))
-       (body (tracer "FBODY" (<compound-command> alias-stack)))
-       (redirect (maybe (<redirect-list>))))
-    (result `(plush::define-function ,(second fname) ',body ',redirect))))
-
-(defun <brace-group> (alias-stack)
-  (=let*
-      ((_ (rword :{))
-       (cmd (<compound-list> alias-stack))
-       (_ (rword :})))
-    (result `(plush::brace-group ',cmd))))
-
-(defun <do-group> (alias-stack)
-  (=prog2
-   (rword :do)
-   (<compound-list> alias-stack)
-   (rword :done)))
-
-;;BUG TODO UGLY DAMNIT POSIX
-;;This can backtrack, potentially across a HERE-DOC
-;;That breaks my ugly hack for newline-skip :(
-
-(defun <alias-command> (alias-stack)
-  (lambda (input)
-    (let ((stuff (funcall
-		  (=let*
-		      ((prefix (tracer "PRE" (<cmd-prefix> t)))
-		       (cmd (if prefix
-				(maybe (<word> nil t))
-				(<word> +reserved-words+ t))))
-		    ;(format t "~%PREFIX: ~A~%" prefix)
-		    ;(format t "~%PREFIX2: ~A~%" (mapcar #'append prefix))
-		    (result (cons (reduce #'append prefix) cmd)))
-		  input)))
-      (when input
-	(let* ((prefix (caaar stuff))
-	       (cmd (cdaar stuff))
-	       (rest (cdar stuff))
-	       (spi (token-source-input input))
-	       (alias (and (not (member (second cmd) alias-stack :test #'string=))
-			   (plush::alias-substitute (second cmd)))))
-	  (if alias
-	      (let ((backtrack-to
-		     (or
-		      (and prefix (third (car prefix)))
-		      (third cmd)))
-		    (cmd-start (third cmd))
-		    (cmd-end (fourth cmd)))
-	    (progn
-	      ;(format t "Alias-test: ~S ~S ~S~%" prefix cmd rest)
-	      (funcall (<command> (cons (second cmd) alias-stack))
-		       (make-token-source
-			:parser (token-source-parser input)
-			:line-cache nil
-			:input
-			(make-string-position-input
-			 :position 0
-			 :string (concatenate 'string
-					      (subseq (spi-string spi)
-						      backtrack-to cmd-start)
-					      alias
-					      (subseq (spi-string spi)
-						      cmd-end)))))))))))))
-      
-      
-(defun <simple-command> (alias-stack)
-  (=or (<alias-command> alias-stack)
-       (<truely-simple-command>)))
-
-(defun <truely-simple-command> ()
-  (=let*
-      ((prefix (<cmd-prefix>))
-       (cmd
-	(if prefix
-	    (maybe (<word>))
-	    (<word> +reserved-words+)))
-       (suffix (if cmd
-		   (<cmd-suffix>)
-		   (result nil))))
-    (let
-	((assignments
-	  (loop for item in prefix
-	     when (eql (car item) :assignment)
-	     collect (cadadr item)))
-	 (redirects
-	  (append
-	   (loop for item in prefix
-	      when (eql (car item) :io-redirect)
-	      collect (second item))
-	   (loop for item in suffix
-	      when (eql (car item) :io-redirect)
-	      collect (second item))))
-	 (other-words
-	  (loop for item in suffix
-	     when (eql (car item) :word)
-	     collect (second item))))
-					;(format t "~S~%" prefix)
-					;(if cmd
-      (result `(plush::simple-command
-		(plush::expand-word-list (quote ,(append (cdr cmd) other-words)))
-		
-		(quote ,redirects)
-		(plush::expand-word-list (quote ,assignments)
-					 :split-fields nil
-					 :variable-assignment t))))))
-	  ;(result `(plush::set-vars (quote ,assignments)))))))
-
-(defun <cmd-prefix> (&optional alias-mode)
-  (zero-or-more
-   (=or
-    (<io-redirect> alias-mode)
-    (<assignment-word> alias-mode))))
-
-(defun <assignment-word> (&optional alias-mode)
-  (=let*
-      ((word (<word> nil alias-mode)))
-    (if
-     (let ((pos (position #\= (second word))))
-     (and pos
-	  (not (char= (elt (second word) 0) #\=))
-	  (funcall
-	   (=and
-	    (posix-name)
-	    (=not (item))) (subseq (second word) 0 pos))))
-     (result
-      (if alias-mode
-	  (list word)
-	  (list :assignment word)))
-     (fail))))
-      
-(defun <cmd-suffix> ()
-  (zero-or-more
-   (=or
-    (<io-redirect>)
-    (<word>))))
-
-(defun <redirect-list> ()
-  (=let* ((list (one-or-more (<io-redirect>))))
-    (result (mapcar #'second list))))
-
-(defun <io-redirect> (&optional alias-mode)
-  (=let*
-      ((number (maybe (=satisfies (lambda (x) (eql (car x) :io-number)))))
-       (to
-	(=or
-	 (<io-file> (second number) alias-mode)
-	 (tracer "IOHERE"
-	 (<io-here> (second number) alias-mode)))))
-    (result 
-     (if alias-mode
-	 (append number to)
-	 (list :io-redirect to)))))
-
-(defun <io-file> (number &optional alias-mode)
-  (=let*
-      ((op
-	(=or
-	 (op "<")
-	 (op "<&")
-	 (op ">")
-	 (op ">&")
-	 (op ">>")
-	 (op "<>")
-	 (op ">|")))
-       (filename (<word> nil alias-mode)))
-    (result
-     (if alias-mode
-	 (list op filename)
-	 (list :io-file (car op) (second filename)
-	       (when number (parse-integer number)))))))
-
-(defun <io-here> (number &optional alias-mode)
-  (=let*
-      ((op
-	(=or
-	 (op "<<")
-	 (op "<<-")))
-       (here-end (<word> nil alias-mode)))
-    (result
-     (if alias-mode
-	 (list op here-end)
-	 `(:io-here ,(car op)
-		    (,(plush::unquote (second here-end))
-		      ,(if (string= (plush::unquote (second here-end))
-				    (second here-end))
-			   (list 'plush::expand-here-doc
-				 (second (third op)))
-			   (second (third op))))
-		    ,(when number (parse-integer number)))))))
-
-(defun <newline> ()
-   (=satisfies (lambda (x) (eql (car x) :newline))))
-
-(defun <newline-list> ()
-  (one-or-more
-   (<newline>)))
-
-(defun <linebreak> ()
-  (maybe (<newline-list>)))
-
-(defun <separator-op> ()
-    (=or
-     (op "&")
-     (op ";")))
-
-(defun <separator> ()
-  (=or
-   (=prog1
-    (<separator-op>)
-    (<linebreak>))
-   (<newline-list>)))
-
-(defun <sequential-sep> ()
-  (=or
-   (=prog1
-    (op ";")
-    (<linebreak>))
-   (<newline-list>)))
-
-(defun op (op)
-  (=satisfies
-   (compose
-    (curry #'eql (make-keyword (string op)))
-    #'car)))
-
-(defun rword (word)
-  (=let*
-      ((rword (=satisfies
-	       (lambda (x)
-		 (and
-		  (eql (car x) :token)
-		  (string= (string-downcase (symbol-name word)) (second x)))))))
-    (result (make-keyword (string-upcase (second rword))))))
-
-(defun <and-if> ()
-  (=satisfies (compose (curry #'eql :&&) #'car) ))
-
-(defun <open-paren> ()
-  (=satisfies (compose (curry #'eql :\() #'car) ))
-
-(defun <close-paren> ()
-  (=satisfies (compose (curry #'eql :\)) #'car) ))
-
-(defun <vbar> ()
-  (=satisfies (compose (curry #'eql :\|) #'car) ))
-
-(defun <or-if> ()
-  (=satisfies (compose (curry #'eql :\|\|) #'car) ))
-    
-#+(or)(defun get-another-command (rest)
-  (destructuring-bind (&optional result) 
-      (funcall (<complete-command> nil) rest)
-    (when result
-	(values (car result)
-		(cdr result)))))
-
-(defun parse-one-command (input)
-  (let* ((source (make-token-source :parser (posix-token)
-				    :input (make-string-position-input :string input)))
-	 (parsed-input (funcall (<complete-command> nil) source)))
-    (if parsed-input
-	(destructuring-bind ((parsed . rest)) parsed-input
-	  (values parsed (spi-position (token-source-input rest))))
-	(error (make-condition 'posix-parse-failed :format-control "Failed to parse")))))
-	
-  
-(defun parse-posix-stuff (input)
-  (let* ((source (make-token-source :parser (posix-token)
-				  :input (make-string-position-input :string input))))
-    (loop
-       for input  = source then rest
-       for parsed-input = (funcall (<complete-command> nil) input)
-	 for ((result . rest)) = parsed-input
-	 ;do (format *error-output* "~A" parsed-input)
-	 when (not parsed-input)
-	 do (error (make-condition 'posix-parse-failed :format-control "Failed to parse"))
-	 append result
-	 while (not (smug::input-empty-p rest)))))
+
+(defrule here-doc-reader
+   (&
+    (function here-doc-internal)))
+
+(defrule here-doc-op
+     (and
+       (or "<<-" "<<")
+       (? here-doc-reader))
+     (:destructure (op doc)
+                   (list (make-keyword op) op doc)))
+
+
+(defrule operator-start
+   (or "|" "&" ";" "<" ">" "(" ")"))
+
+
+(defrule operator-token
+  (or here-doc-op
+      "&&" "||" ";;" ">>" "<&"
+      ">&" "<>" "|" "&" ";"
+      "<" ">" "(" ")")
+  (:lambda (x)
+    (if (stringp x) (list (make-keyword x) x)
+      x)))
+
+(defrule line-comment
+    (and
+      "#"
+      (*
+        (and
+          (! #\Newline)
+          character)))
+    (:constant nil))
+
+(defun newline-skip (input start end)
+  (declare (ignorable input))
+  (when (>= end (+ start *newline-skip*))
+   (values nil (+ start (shiftf *newline-skip* 0)) t)))
+
+(defrule newline-token
+         (and #\Newline
+              (function newline-skip))
+         (:constant (list :newline #.(string #\Newline))))
+
+(defrule io-number
+    (and
+      (* (digit-char-p character))
+      (& (or "<" ">")))
+    (:destructure (num _)
+		  (declare (ignore _))
+                  (list :io-number (text num))))
+
+(defrule blank-character
+  (or #\Space #\Page #\Return #\Tab #\Vt
+      #.(coerce '(#\\ #\Newline) 'string))
+  (:constant nil))
+
+(defrule backslash-quote
+    (and #\\ character)
+    (:text t))
+
+(defun not-dquote (x)
+  (char/= #\" x))
+
+(defun not-squote (x)
+  (char/= #\' x))
+
+(defun dquote-error (&rest x)
+  (declare (ignore x))
+  (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for \"")))
+
+(defun squote-error (&rest x)
+  (declare (ignore x))
+  (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for \'"))) 
+
+(defrule double-quoted-meat
+  (and
+    #\"
+    (or (and
+          (*
+	   (and
+	    (! #\")
+	    (or
+	     backslash-quote
+	     arithmetic-expansion
+	     command-substitution
+	     parameter-expansion
+	     lisp-expansion
+	     (not-dquote character))))
+          #\")
+        (function dquote-error)))
+    (:text t))
+
+(defrule single-quoted-meat
+         (and
+           #\'
+           (or (and
+                 (* (not-squote character))
+                 #\')
+               (function squote-error)))
+         (:text t))
+
+(defrule parenthesized-expression
+  (and
+    "("
+    (* (or "\\)"
+           (and (! ")") character)))
+    ")")
+  (:text t))
+
+(defrule lisp-expansion
+  (and
+    "$["
+    (function one-lisp-form)
+    "]")
+  (:text t))
+
+(defrule arithmetic-expansion
+  (and
+    "$(("
+    (*
+      (and
+        (! "))")
+        token-string-until-unbalanced-paren))
+    "))")
+  (:text t))
+
+(defrule command-substitution
+  (or
+    (and "`"
+         (*
+	  (or "\$" "\`" "\\\\"
+	      (and (! "\`") character)))
+         "`")
+    (and
+      "$("
+      token-string-until-unbalanced-paren
+      ")"))
+  (:text t))
+
+(defmacro token-or-pair (name start end)
+  `(progn
+     (defun ,(intern (concatenate 'string "EOF-" (symbol-name name)))
+       (&rest r)
+       (declare (ignore r))
+       (error (make-condition 'eof-when-tokenizing :format-control "EOF looking for ~A" :format-arguments (list ,end))))
+     (defrule ,name
+      (and
+        (*
+          (or
+            (and (! character)
+                 (function ,(intern (concatenate 'string "EOF-" (symbol-name name)))))
+            (and (! ,end)
+                 (or 
+                   (and ,start
+                        ,name
+                        ,end)
+                   token-meat
+                   (and (! ,start) character))))))
+      (:text t))))
+
+(token-or-pair token-string-until-unbalanced-brace "{" "}")
+(token-or-pair token-string-until-unbalanced-paren "(" ")")
+
+(defun posix-start-char (x)
+  (position x "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"))
+
+(defun posix-entity-char (x)
+  (position x "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_1234567890"))
+
+(defrule posix-name
+ (and
+   (posix-start-char character)
+   (* (posix-entity-char character)))
+  (:text t))
+
+
+(defrule parameter-expansion
+  (and
+    "$"
+    (or
+      (and
+        "{"
+        token-string-until-unbalanced-brace
+        "}")
+      posix-name))
+  (:text t))
+
+(defrule token-meat
+  (and
+    (! operator-start)
+    (! eof-token)
+    (! #\Newline)
+    (! blank-character)
+    (or
+      backslash-quote
+      double-quoted-meat
+      single-quoted-meat
+      lisp-expansion
+      arithmetic-expansion
+      command-substitution
+      parameter-expansion
+      character)))
+
+(defrule token-string
+  (and
+    (* #.(coerce '(#\\ #\Newline) 'string))
+    (* blank-character)
+    (* #.(coerce '(#\\ #\Newline) 'string))
+    posix-token)
+  (:destructure (a b c tok)
+                (text (list a b c (second tok)))))
+
+(defrule posix-word
+  (+ token-meat)
+  (:lambda (x) (list :token (text x))))
+
+(defrule token-boundaries
+  (or
+    operator-token
+    io-number
+    newline-token
+    eof-token
+    posix-word)
+  (:lambda (x &bounds start end)
+    (append x (list start end *newline-skip*))))
+
+(defrule posix-token
+  (and
+    (* blank-character)
+    (* line-comment)
+    token-boundaries)
+  (:destructure (x y z)
+		(declare (ignore x y))
+		z))
+
+(defun get-posix-tokens (input)
+  (loop
+       for (result newstart success) = (multiple-value-list (esrap:parse 'posix-token input :junk-allowed t)) then
+       (multiple-value-list (esrap:parse 'posix-token input :start (or newstart (length input)) :junk-allowed t))
+       collect result
+       while (not (eql (car result) :eof))))
 
 (defmacro with-temp-fd ((fd-var name-var &optional (template "/tmp/plush") ignore-unlink-errors) &body body)
   `(multiple-value-bind (,fd-var ,name-var) (isys:mkstemp ,template)
@@ -986,152 +335,147 @@
 	       (isys:unlink ,name-var))
 	    `(isys:unlink ,name-var)))))
 
-(defun do-arithmetic-expansion()
-  (=let*
-      ((_ (=string "$(("))
-       (stuff
-	(zero-or-more
-	 (=and
-	  (=not (=string "))"))
-	  (token-string-until-unbalanced-paren))))
-       (_ (=string "))")))
-    (let*
-	((expanded
-	  (funcall
-	   (do-some-expansions
-	       (do-command-expansion)
-	     (do-lisp-expansion)
-	     (do-parameter-expansion)
-	     (do-quote-expansion)
-	     (do-backslash-expansion))
-	   (apply #'concatenate 'string stuff)))
-	 (parsed (funcall (plush-parser::arithmetic-expr) (caaar expanded))))
-      (when (not (emptyp (cdar parsed)))
-	(error "Parse error doing arithmetic expansion of ~A" expanded))
-      (result (format nil "~D" (run-arithmetic (caar parsed)))))))
+(defrule do-arithmetic-expansion
+  (and
+   "$(("
+   (*
+    (and
+     (! "))")
+     token-string-until-unbalanced-paren))
+   "))")
+  (:destructure (start stuff end)
+		(declare (ignore start end))
+    (let* ((expanded
+	    (esrap:text
+	     (do-some-expansions
+		 stuff
+		 'do-command-expansion
+	       'do-lisp-expansion
+	       'do-parameter-expansion
+	       'do-quote-expansion
+	       'do-backslash-expansion)))
+	   (parsed (esrap:parse 'arithmetic-expr expanded)))
+      (format nil "~D" (run-arithmetic parsed)))))
 
-(defun do-special-parameter-expansion(&optional dquote)
-  (=let*
-      ((_ (=char #\$))
-       (param (=satisfies
-	       (lambda (x)
-		 (member (make-keyword x) plush::+special-variables+)))))
-    (result 
-     (plush::get-parameter (string param) dquote))))
+(defun is-special-variable (x)
+  (member (make-keyword x) plush::+special-variables+))
 
-(defun do-numeric-parameter-expansion()
-  (=let*
-      ((_ (=char #\$))
-       (n (=satisfies #'digit-char-p)))
-    (result (plush::get-parameter (string n)))))
+(defrule do-special-parameter-expansion
+   (and
+    "$"
+    (is-special-variable character))
+  (:destructure
+   (dollar name)
+   (declare (ignore dollar))
+   (plush::get-parameter (string name) nil)))
 
-(defun do-double-quote-expansion()
-  (=let*
-      ((_ (=char #\"))
-       (meat
-	(zero-or-more
-	 (=and
-	  (=not (=char #\"))
-	  (=or
-	   (backslash-quote)
-	   (arithmetic-expansion)
-	   (lisp-expansion)
-	   (command-substitution)
-	   (parameter-expansion)
-	   (item)))))
-       (_ (=char #\")))
-    (let*
-	((expanded
-	  (funcall
-	   (do-some-expansions
-	       (do-command-expansion)
-	     (do-parameter-expansion t)
-	     (do-quote-expansion)
-	     (do-backslash-expansion))
-	   (apply #'concatenate 'string
-		  (mapcar 'string meat)))))
-      (if expanded
-	  (result (caar expanded))
-	  (fail)))))
-      
-(defun do-lisp-expansion()
-  (=let*
-      ((string (lisp-expansion)))
+(defrule do-special-parameter-expansion-dquote
+   (and
+    "$"
+    (is-special-variable character))
+  (:destructure
+   (dollar name)
+   (declare (ignore dollar))
+   (plush::get-parameter (string name) t)))
+
+(defrule do-numeric-parameter-expansion
+    (and "$"
+	 (digit-char-p character))
+  (:destructure
+   (dollar number)
+   (declare (ignore dollar))
+   (plush::get-parameter (string number))))
+
+(defrule do-double-quote-expansion
+    double-quoted-meat
+  (:lambda (x)
+     (do-some-expansions
+	 (subseq x 1 (1- (length x)))
+       'do-command-expansion
+       'do-lisp-expansion
+       'do-parameter-expansion
+       'do-quote-expansion
+       'do-backslash-expansion)))
+       
+(defrule do-lisp-expansion
+    lisp-expansion
+  (:lambda (string)
     (let ((string (subseq string 2 (1- (length string)))))
-      (result (format nil "~a" (eval (read-from-string string)))))))
+      (format nil "~a" (eval (read-from-string string))))))
 
-(defun do-command-expansion()
-  (=let*
-      ((string (command-substitution)))
-    (let
-	((string
-	  (subseq string
-		  (if (equal (char string 0) #\`) 1 2)
-		  (1- (length string)))))
+(defrule do-command-expansion
+      command-substitution
+  (:lambda (string)
+    (let ((string
+	(subseq string
+		(if (equal (char string 0) #\`) 1 2)
+		(1- (length string)))))
       (with-temp-fd  (fd fname)
 	(plush::with-subshell (t)
 	  (isys:dup2 fd iolib/os:+stdout+)
-	  (mapc #'eval (parse-posix-stuff string))
+	  (mapc #'eval (plush-parser::parse-posix-stuff string))
 	  (isys:exit 0))
-	(result
-          (let ((str (coerce
-                       (with-open-file (s fname)
-                         (loop for c = (read-char s nil :eof)
-                               until (eql c :eof)
-                               collect c))
-                       'string)))
-            (if (and (> (length str) 0) (char-equal (char str (1- (length str))) #\Newline))
-              (subseq str 0 (1- (length str))) str)))))))
+	(let ((str (coerce
+		    (with-open-file (s fname)
+		      (loop for c = (read-char s nil :eof)
+			 until (eql c :eof)
+			 collect c))
+		    'string)))
+	  (if (and (> (length str) 0) (char-equal (char str (1- (length str))) #\Newline))
+              (subseq str 0 (1- (length str))) str))))))
 
-(defun parameter-default ()
-  (=let*
-      ((_ (=char #\:))
-       (_ (=char #\-))
-       (word (token-string-until-unbalanced-brace)))
-    (result (list :default word))))
+(defrule parameter-default
+  (and
+   ":-"
+   token-string-until-unbalanced-brace)
+   (:destructure (_ word)
+		 (declare (ignore _))
+    (list :default word)))
 
-(defun parameter-assign ()
-  (=let*
-      ((_ (=char #\:))
-       (_ (=char #\=))
-       (word (token-string-until-unbalanced-brace)))
-    (result (list :assign word))))
+(defrule parameter-assign
+  (and
+   ":="
+   token-string-until-unbalanced-brace)
+    (:destructure (_ word)
+		 (declare (ignore _))
+		 (list :assign word)))
 
-(defun parameter-alternative ()
-  (=let*
-      ((_ (=char #\:))
-       (_ (=char #\+))
-       (word (token-string-until-unbalanced-brace)))
-    (result (list :alternative word))))
+(defrule parameter-alternative
+    (and
+     ":+")
+  (:destructure (_ word)
+		 (declare (ignore _))
+		(list :alternative word)))
 
-(defun parameter-error ()
-  (=let*
-      ((_ (=char #\:))
-       (_ (=char #\=))
-       (word (token-string-until-unbalanced-brace)))
-    (result (list :error word))))
+(defrule parameter-error
+  (and
+   ":?"
+   token-string-until-unbalanced-brace)
+  (:destructure (_ word)
+		 (declare (ignore _))
+    (list :error word)))
 
-(defun parameter-option ()
-  (=or
-   (parameter-default)
-   (parameter-assign)
-   (parameter-error)
-   (parameter-alternative)))
+(defrule parameter-option
+  (or
+   parameter-default
+   parameter-assign
+   parameter-error
+   parameter-alternative))
 
-(defun do-parameter-brace-expansion()
-  (=let*
-      ((_ (=char #\$))
-       (_ (=char #\{))
-       (name
-	(string-of 
-	 (zero-or-more
-	  (=satisfies
-	   (lambda (x) (and
-			(char/= x #\:)
-			(char/= x #\})))))))
-       (option (maybe (parameter-option)))
-       (_ (=char #\})))
-    (result
+(defrule do-parameter-brace-expansion
+    (and
+     "${"
+     (*
+      (and
+       (! #\:)
+       (! #\})
+       character))
+     (? parameter-option)
+     "}")
+  (:destructure
+   (start name option end)
+   (declare (ignore start end))
+   (let ((name (text name)))
      (let
 	 ((value (plush::get-parameter name))
 	  (word (when option (second option))))
@@ -1155,36 +499,49 @@
 	  (format *error-output*
 		  "~%Attempt to read from undefined paramter ~A~%" name)))))))
 
-(defun do-quote-expansion()
-  (single-quoted-meat))
+(defrule do-quote-expansion
+  single-quoted-meat)
 
-(defun do-backslash-expansion()
-  (=let*
-      ((_ (=char #\\))
-       (c (item)))
-    (result (format nil "\\~C" c))))
+(defrule do-backslash-expansion
+  (and #\\ character)
+  (:text t))
 
-(defun tilde-expand (is-assignment)
-  (=let*
-      ((_ (=char #\~))
-       (expandme
-	(string-of
-	 (zero-or-more
-	  (=satisfies
-	   (lambda (x)
-	     (not
-	      (or
-	       (char= x #\/)
-	       (and is-assignment (char= x #\:))))))))))
-    (if (string= expandme "")
-	(result (iolib/os:environment-variable "HOME"))
-	(result (nth-value 5 (isys:getpwnam expandme))))))
+(defrule tilde-expand-assignment
+    (and
+     "~"
+     (*
+      (and
+       (! "/")
+       (! ":")
+      character)))
+  (:destructure
+   (tilde expandme)
+   (declare (ignore tilde))
+   (let ((expandme (text expandme)))
+     (if (string= expandme "")
+	 (iolib/os:environment-variable "HOME")
+	 (nth-value 5 (isys:getpwnam expandme))))))
 
-(defun colon-tilde-expand ()
-  (=let*
-      ((_ (=char #\:))
-       (expansion (tilde-expand t)))
-    (result (format nil ":~A" expansion))))
+(defrule tilde-expand
+    (and
+     "~"
+     (*
+      (and
+       (! "/")
+       character)))
+  (:destructure
+   (tilde expandme)
+   (declare (ignore tilde))
+   (let ((expandme (text expandme)))
+     (if (string= expandme "")
+	 (iolib/os:environment-variable "HOME")
+	 (nth-value 5 (isys:getpwnam expandme))))))
+
+(defrule colon-tilde-expand
+    (and
+     ":"
+     tilde-expand-assignment)
+  (:text t))
 
 (defun join-strings-preserving-lists (list)
   (loop
@@ -1204,139 +561,172 @@
 			    (list 
 			     (apply #'concatenate 'string (nreverse this-string))))))))
 
-(defun do-name-parameter-expansion ()
-  (=let* ((_ (=char #\$))
-	  (name
-	   (string-of
-	    (posix-name))))
-    (let ((v (plush::get-parameter name)))
-      (result (or v "")))))
+(defrule do-name-parameter-expansion
+    (and "$"
+	 posix-name)
+  (:destructure (dollar name)
+		(declare (ignore dollar))
+    (let ((v (plush::get-parameter (text name))))
+      (or v ""))))
 
-(defun do-parameter-expansion (&optional dquote)
-  (=or
-   (do-parameter-brace-expansion)
-   (do-lisp-expansion)
-   (do-special-parameter-expansion dquote)
-   (do-numeric-parameter-expansion)
-   (do-name-parameter-expansion)))
+(defrule do-parameter-expansion
+    (or
+     do-parameter-brace-expansion
+     do-lisp-expansion
+     do-special-parameter-expansion
+     do-numeric-parameter-expansion
+     do-name-parameter-expansion))
 
-(defun do-some-expansions (&rest parsers)
-  (=let* ((stuff
-	   (zero-or-more
-	    (apply #'=or
-		   (append parsers (list
-				    (item)))))))
-    (result (join-strings-preserving-lists stuff))))
+(defrule do-parameter-expansion-dquote
+    (or
+     do-parameter-brace-expansion
+     do-lisp-expansion
+     do-special-parameter-expansion-dquote
+     do-numeric-parameter-expansion
+     do-name-parameter-expansion))
+
+(defun do-some-expansions (expandme &rest parsers)
+  (let ((stuff
+	 (esrap:parse `(* (or ,@parsers character)) expandme)))
+    (join-strings-preserving-lists stuff)))
 
 					;TODO apply field splitting to results of expansion
-(defun expand-here-doc-parser ()
-(=let*
-    ((rest
-      (zero-or-more
-       (=or
-	(do-arithmetic-expansion)
-	(do-command-expansion)
-	(tracer "DPE"
-		(do-parameter-expansion))
-	(do-backslash-expansion)
-	(item)))))
-    (result (join-strings-preserving-lists
-	     rest))))
+(defrule expand-here-doc-parser
+    (*
+     (or
+      do-arithmetic-expansion
+      do-command-expansion
+      do-parameter-expansion
+      do-backslash-expansion
+      charater))
+  (:lambda (rest)
+    (join-strings-preserving-lists
+     rest)))
 
-(defun expand-word-parser (is-assignment)
-  (=let*
-      ((start
-	(maybe
-	 (tilde-expand is-assignment)))
-       (rest
-	(zero-or-more
-	 (=or
-	  (do-arithmetic-expansion)
-	  (do-command-expansion)
-	  (tracer "DPE"
-	  (do-parameter-expansion))
-	  (do-double-quote-expansion)
-	  (do-quote-expansion)
-	  (do-backslash-expansion)
-	  (if is-assignment
-	      (colon-tilde-expand)
-	      (fail))
-	  (item)))))
-    (result (join-strings-preserving-lists
-	     (if start
-		 (cons start rest)
-		 rest)))))
+(defrule expand-word-parser
+  (and
+   (? tilde-expand)
+   (*
+    (or
+     do-arithmetic-expansion
+     do-command-expansion
+     do-parameter-expansion
+     do-double-quote-expansion
+     do-quote-expansion
+     do-backslash-expansion
+     character) ))
+  (:destructure
+   (start rest)
+   (join-strings-preserving-lists
+    (if start
+	(cons start rest)
+	rest))))
 
-(defun glob-equiv () (fail)) ;TODO STUB
-(defun glob-class () (fail)) ;TODO STUB
-(defun glob-collating () (fail)) ;TODO STUB
+(defrule expand-word-parser-assignment
+  (and
+   (? tilde-expand-assignment)
+   (*
+    (or
+     do-arithmetic-expansion
+     do-command-expansion
+     do-parameter-expansion
+     do-double-quote-expansion
+     do-quote-expansion
+     do-backslash-expansion
+     colon-tilde-expand
+     character) ))
+  (:destructure
+   (start rest)
+   (join-strings-preserving-lists
+    (if start
+	(cons start rest)
+	rest))))
 
-(defun glob-bracket ()
-  (=let*
-      ((invert (maybe (=char #\!)))
-       (stuff
-	(zero-or-more
-	 (=or
-	  (glob-collating)
-	  (glob-equiv)
-	  (glob-class)
-	  (glob-quote)
-	  (=satisfies (lambda (x) (char/= x #\]))))))
-       (_ (=char #\])))
-    (if stuff
-	(result `(,(if invert
-		       :inverted-char-class
-		       :char-class) ,@(flatten stuff)))
-	"[]")))
+(defrule glob-equiv (and (! character) character)) ;TODO STUB
+(defrule glob-class (and (! character) character)) ;TODO STUB
+(defrule glob-collating (and (! character) character)) ;TODO STUB
 
-(defun glob-special ()
-  (=let*
-      ((special-char
-	(=or
-	 (=char #\*)
-	 (=char #\?)
-	 (=char #\[))))
-    (cond
-      ((char= special-char #\*)
-       (result '(:greedy-repetition 0 nil :everything)))
-      ((char= special-char #\?)
-       (result :everything))
-      ((char= special-char #\[)
-       (glob-bracket)))))
+(defrule glob-bracket
+    (and
+     "["
+     (? "!")
+     (*
+      (or
+       glob-collating
+       glob-equiv
+       glob-class
+       glob-quote
+       (and
+	(! "]")
+	character)))
+     "]")
+  (:destructure
+   (start invert stuff end)
+   (declare (ignore start end))
+   (if stuff
+       `(,(if invert
+	     :inverted-char-class
+	     :char-class) ,@(alexandria:flatten stuff))
+       "[]")))
+     
 
-(defun glob-quote-as-sequence ()
-  (=let* ((stuff (glob-quote)))
-    (result `(:sequence ,@(or stuff '(:void))))))
+(defrule glob-star
+    "*"
+  (:constant
+   '(:greedy-repetition 0 nil :everything)))
 
-(defun glob-quote ()
-  (=or
-   (=let* ((_ (=char #\\)))
-     (exactly 1 (item)))
-   (=let* ((_ (=char #\'))
-	   (stuff (zero-or-more (=satisfies (lambda (x) (char/= x #\')))))
-	   (_ (=char #\')))
-     (result stuff)
-     (=let* ((_ (=char #\"))
-	     (stuff
-	      (zero-or-more
-	       (=or
-		(=let* ((_ (=char #\\))
-			(x (item)))
-		  (result x))
-		(=satisfies (lambda (x) (char/= x #\"))))))
-	     (_ (=char #\")))
-       (result stuff)))))
+(defrule glob-question
+    "?"
+  (:constant :everything))
 
-(defun glob-parser ()
-  (=let*
-      ((stuff
-	(zero-or-more
-	 (=or
-	  (glob-special)
-	  (glob-quote-as-sequence)
-	  (item)))))
-    (result `(:sequence :start-anchor ,@stuff :end-anchor))))
+(defrule glob-special
+    (or
+     glob-star
+     glob-question
+     glob-bracket))
 
+(defrule glob-quote-as-sequence
+    glob-quote
+  (:lambda (stuff)
+    `(:sequence ,@(or stuff '(:void)))))
+
+(defrule glob-single-quote
+    (and #\\
+	 character)
+  (:lambda (x) (second x)))
+
+(defrule glob-multi-quote
+    (or
+     (and
+      "'"
+      (* (and (! "'") character))
+      "'")
+     (and
+      #\"
+      (*
+       (or glob-single-quote
+	   (and (! #\") character)))
+      #\"))
+  (:destructure
+   (start stuff end)
+   (declare (ignore start end))
+   (mapcar #'second stuff)))
+
+(defrule glob-quote
+    (or glob-multi-quote
+	glob-single-quote))
+
+(defrule glob-parser
+    (*
+     (or
+      glob-special
+      glob-quote-as-sequence
+      character))
+  (:lambda (stuff)
+    `(:sequence :start-anchor ,@stuff :end-anchor)))
+
+
+#|
 (defun unary-op ()
   (=let*
       ((op 
@@ -1592,3 +982,625 @@
       (:!
        (if (= 0 (run-arithmetic left))
 	   1 0)))))
+
+|#
+(in-package :plush-parser)
+
+(declaim (optimize (debug 3)))
+
+(define-condition posix-parse-failed (simple-error) ())
+
+(defparameter +reserved-words+ '("if" "then" "else" "elif" "fi" "do" "done" "in"
+				 "case" "esac" "while" "until" "for" "{" "}" "!"))
+
+(defparameter *newline-skip* 0)
+    
+#+(or)(defun tracer (string parser)
+  (lambda (input)
+    (format t "~A: ~S~%" string input)
+    (let ((result (funcall parser input)))
+      (format t "~A=>: ~S~%" string result)
+      result)))
+#-(or)(defun tracer (string parser)
+  (declare (ignore string))
+  parser)
+     
+
+;This needs to be line cached because our
+;Tokenizer includes side-effects that disallows backtracking within a line
+(defstruct token-source
+  (parser nil :type symbol)
+  (line-cache nil :type list)
+  (input "")
+  (position 0))
+
+(defun line-cache-fill (input)
+  (when (null (token-source-line-cache input))
+    ;(print input)
+    (setf (token-source-line-cache input)
+	  (loop
+	     for (result newstart success) =
+	       (multiple-value-list (esrap:parse (token-source-parser input) (token-source-input input)
+						 :junk-allowed t :start (token-source-position input)))
+	     then
+	       (multiple-value-list (esrap:parse (token-source-parser input) (token-source-input input)
+						 :start (or newstart (length (token-source-input input))) :junk-allowed t))
+	     collect result
+	       ;do (print result)
+	     while (and
+		    (not (eql (car result) :eof))
+		    (not (eql (car result) :newline)))
+	     finally (setf (token-source-position input)
+			   (or newstart (length (token-source-input input)))))))
+  ;(print input)
+  (token-source-line-cache input))
+
+(defmethod smug::input-first ((input token-source))
+  (let
+      ((line-cache (line-cache-fill input)))
+    (car line-cache)))
+
+(defmethod smug::input-rest ((input token-source))
+  (let
+      ((line-cache (line-cache-fill input)))
+    (make-token-source
+     :parser (token-source-parser input)
+     :line-cache (cdr line-cache)
+     :input (token-source-input input)
+     :position (token-source-position input))))
+
+(defmethod smug::input-empty-p ((input token-source))
+  (let
+      ((line-cache (line-cache-fill input)))
+  (eql :eof (caar line-cache))))
+
+(defun convert-maybe-async-list (list)
+  (loop for (cmd op . rest) = list then rest
+       while cmd
+       if (eql (car op) :&)
+       collect (list 'plush::asynchronous-cmd cmd)
+       else collect cmd))
+   
+(defun <complete-command> (alias-stack)
+  (tracer "CC"
+  (=or
+   (=not (item))
+   (=satisfies (lambda (x) (and (consp x) (eql (car x) :eof))))
+   (=let* ((_ (<newline-list>)))
+     (result
+      '(())))
+   (=let*
+	((list (<list> alias-stack))
+	(op (maybe (<separator>))))
+     (let
+	 ((fixed-list (append list (list op))))
+       (result
+	(convert-maybe-async-list fixed-list)))))))
+
+(defun collect-list-and-separators (list-sep last)
+  (loop for list = list-sep then (cdr list)
+       when list
+       append (car list)
+       else collect last
+       while list))
+
+(defun <list> (alias-stack)
+  (=let*
+      ((first (<and-or> alias-stack))
+       (rest
+	(zero-or-more
+	 (=let* ((op (<separator-op>))
+		 (andor (<and-or> alias-stack)))
+	   (result (list op andor))))))
+    (result (cons first (reduce #'append rest)))))
+
+(defun <and-or> (alias-stack)
+  (=let*
+      ((conditionals
+	(zero-or-more
+	 (=let*
+	     ((pipe (<pipeline> alias-stack))
+	      (op
+	       (=or (<and-if>)
+		    (<or-if>)))
+	      (_ (<linebreak>)))
+	   (result
+	    (list pipe op)))))
+       (last (<pipeline> alias-stack)))
+    (result
+     (reduce (lambda (x y)
+	       (destructuring-bind (pipe op) x
+		 (if
+		  (eql (car op) :&&)
+		       (list 'plush::shell-and pipe y)
+		       (list 'plush::shell-or pipe y))))
+		  conditionals
+	       :from-end t :initial-value last))))
+
+(defun <pipeline> (alias-stack)
+    (=let*
+	((bang (maybe (rword :!)))
+	 (sequence (<pipe-sequence> alias-stack)))
+      (result
+       (if bang
+	   `(plush::invert-result ,sequence)
+	   sequence))))
+
+(defun <pipe-sequence> (alias-stack)
+  (=let*
+      ((stuff
+	(zero-or-more
+	 (=prog1
+	  (<command> alias-stack)
+	  (<vbar>)
+	  (<linebreak>))))
+       (last (<command> alias-stack)))
+    (result
+     `(plush::run-pipe
+	     ,@stuff
+	     ,last))))
+
+(defun <command> (alias-stack)
+  (=or
+   (<function-definition> alias-stack)
+   (<simple-command> alias-stack)
+   (=let*
+       ((cmd (<compound-command> alias-stack))
+	(redir (maybe (<redirect-list>))))
+     (result `(plush::compound-command ,cmd ',redir)))))
+
+(defun <compound-command> (alias-stack)
+  (=let*
+      ((cmd
+	(=or (<brace-group> alias-stack)
+	     (<subshell> alias-stack)
+	     (<for-clause> alias-stack)
+	     (<case-clause> alias-stack)
+	     (<if-clause> alias-stack)
+	     (<while-until-clause> alias-stack))))
+    (result
+     cmd)))
+
+(defun <subshell> (alias-stack)
+  (=let*
+      ((_ (<open-paren>))
+       (list (<compound-list> alias-stack))
+       (_ (<close-paren>)))
+    (result
+     (list 'plush::with-subshell '(t) list))))
+
+(defun <compound-list> (alias-stack )
+  (=let*
+      ((_ (maybe (<newline-list>)))
+       (stuff
+	(zero-or-more
+	 (=let*
+	     ((item (<and-or> alias-stack))
+	      (sep (<separator>)))
+	   (result (list item sep)))))
+       (last
+	(if (zerop (length stuff))
+	    (<and-or> alias-stack)
+	    (maybe (<and-or> alias-stack)))))
+    (result
+     (convert-maybe-async-list
+      (if last
+	  (collect-list-and-separators stuff last)
+	  (mapcan #'copy-list stuff))))))
+
+(defun <for-clause> (alias-stack)
+  (=let*
+      ((_ (rword :for))
+       (name (<name>))
+       (_ (<linebreak>))
+       (in (maybe (rword :in)))
+       (wordlist
+	(if in
+	    (maybe (<wordlist>))
+	    (result nil)))
+       (_ (if in (<sequential-sep>)
+	      (result t)))
+       (do-group (<do-group> alias-stack)))
+    (let
+	((wordlist (if in wordlist '("$@"))))
+      (result
+       `(plush::posix-for ,(second name) (plush::expand-word-list ,`(quote ,wordlist)) ,`(quote ,do-group))))))
+
+(defun <name> ()
+  (=let*
+   ((name (=satisfies (lambda (x)
+			(and (eql :token (car x))
+			     (handler-case
+				 (esrap:parse 'plush-token::posix-name (second x))
+			       (t nil)))))))
+    (result (list :name (second name)))))
+
+
+(defun <wordlist> ()
+  (=let* ((words (one-or-more (<word>))))
+    (result (mapcar #'second words))))
+
+(defun <word> (&optional disallowed-rsvd alias-mode)
+  (=let*
+      ((word (=satisfies (compose (curry #'eql :token) #'car))))
+    (if
+     (member (second word) disallowed-rsvd :test #'string=)
+     (fail)
+     (result (if alias-mode
+		 word
+		 (list :word (second word)))))))
+
+(defun <case-clause> ( alias-stack)
+  (=let*
+      ((_ (rword :case))
+       (word (<word>))
+       (_ (<linebreak>))
+       (_ (rword :in))
+       (_ (<linebreak>))
+       (stuff
+	(zero-or-more
+	 (=let*
+	     ((_ (maybe (op #\()))
+	      (pattern (<pattern>))
+	      (_ (op #\)))
+	      (meat (=or
+		     (<compound-list> alias-stack)
+		     (<linebreak>)))
+	      (_ (op ";;"))
+	      (_ (<linebreak>)))
+	   (result (list pattern meat)))))
+       (last
+	(maybe
+	 (=let*
+	     ((_ (maybe (op #\()))
+	      (pattern (<pattern>))
+	      (_ (op #\)))
+	      (meat (maybe (<compound-list> alias-stack)))
+	      (_ (<linebreak>)))
+	   (result (list pattern meat)))))
+       (_ (rword :esac)))
+    (result
+     `(plush::posix-case ,(second word) ,@stuff ,@(when last `(,last))))))
+
+(defun <pattern> ()
+  (=let*
+      ((_ (=not (rword :esac)))
+       (first (<word>))
+       (rest
+	(zero-or-more
+	 (=and
+	  (op "|")
+	  (<word>)))))
+    (result
+     (mapcar #'second (cons first rest)))))
+
+(defun <if-clause> (alias-stack)
+  (=let*
+      ((_ (rword :if))
+       (if-part (<compound-list> alias-stack))
+       (_ (rword :then))
+       (then-part (<compound-list> alias-stack))
+       (else-part (<else-part> alias-stack))
+       (_ (rword :fi)))
+    (result `(plush::posix-if ,`(quote ,if-part)
+			      ,`(quote ,then-part)
+			      ,`(quote ,else-part)))))
+
+(defun <else-part> (alias-stack)
+  (=or
+   (=let*
+       ((_ (rword :elif))
+	(elif-part (<compound-list> alias-stack))
+	(_ (rword :then))
+	(then-part (<compound-list> alias-stack))
+	(else-part (<else-part> alias-stack)))
+     (result `((plush::run-pipe
+		(plush::posix-if ,`(quote ,elif-part)
+			       ,`(quote ,then-part)
+			       ,`(quote ,else-part))))))
+   (=let*
+       ((else
+	 (maybe
+	  (=and
+	   (rword :else)
+	   (<compound-list> alias-stack)))))
+     (result 
+      else))))
+
+(defun <while-until-clause> (alias-stack)
+  (=let*
+      ((type
+	(=or
+	 (rword :while)
+	 (rword :until)))
+       (while (<compound-list> alias-stack))
+       (do (<do-group> alias-stack)))
+    (result `(plush::posix-while-until ,`',while ,`',do ,(eql type :until)))))
+
+(defun <function-definition> (alias-stack)
+  (=let*
+      ((fname (tracer "FNAME" (<name>)))
+       (_ (op "("))
+       (_ (op ")"))
+       (_ (<linebreak>))
+       (body (tracer "FBODY" (<compound-command> alias-stack)))
+       (redirect (maybe (<redirect-list>))))
+    (result `(plush::define-function ,(second fname) ',body ',redirect))))
+
+(defun <brace-group> (alias-stack)
+  (=let*
+      ((_ (rword :{))
+       (cmd (<compound-list> alias-stack))
+       (_ (rword :})))
+    (result `(plush::brace-group ',cmd))))
+
+(defun <do-group> (alias-stack)
+  (=prog2
+   (rword :do)
+   (<compound-list> alias-stack)
+   (rword :done)))
+
+;;BUG TODO UGLY DAMNIT POSIX
+;;This can backtrack, potentially across a HERE-DOC
+;;That breaks my ugly hack for newline-skip :(
+
+(defun <alias-command> (alias-stack)
+  (lambda (input)
+    (let ((stuff (funcall
+		  (=let*
+		      ((prefix (tracer "PRE" (<cmd-prefix> t)))
+		       (cmd (if prefix
+				(maybe (<word> nil t))
+				(<word> +reserved-words+ t))))
+		    ;(format t "~%PREFIX: ~A~%" prefix)
+		    ;(format t "~%PREFIX2: ~A~%" (mapcar #'append prefix))
+		    (result (cons (reduce #'append prefix) cmd)))
+		  input)))
+      (when input
+	(let* ((prefix (caaar stuff))
+	       (cmd (cdaar stuff))
+	       (rest (cdar stuff))
+	       (input-string (token-source-input input))
+	       (alias (and (not (member (second cmd) alias-stack :test #'string=))
+			   (plush::alias-substitute (second cmd)))))
+	  (declare (ignorable rest))
+	  (if alias
+	      (let ((backtrack-to
+		     (or
+		      (and prefix (third (car prefix)))
+		      (third cmd)))
+		    (newline-skip
+		     (or
+		      (and prefix (fifth (car prefix)))
+		      (fifth cmd)))
+		    (cmd-start (third cmd))
+		    (cmd-end (fourth cmd)))
+	    (progn
+	      ;(format t "Alias-test: ~S ~S ~S~%" prefix cmd rest)
+	      (setf plush-token::*newline-skip* newline-skip)
+	      (funcall (<command> (cons (second cmd) alias-stack))
+		       (make-token-source
+			:parser (token-source-parser input)
+			:line-cache nil
+			:position 0
+			:input
+			 (concatenate 'string
+					      (subseq input-string
+						      backtrack-to cmd-start)
+					      alias
+					      (subseq input-string
+						      cmd-end))))))))))))
+      
+      
+(defun <simple-command> (alias-stack)
+  (=or (<alias-command> alias-stack)
+       (<truely-simple-command>)))
+
+(defun <truely-simple-command> ()
+  (=let*
+      ((prefix (tracer "TS-PRE" (<cmd-prefix>)))
+       (cmd
+	(if prefix
+	    (maybe (<word>))
+	    (<word> +reserved-words+)))
+       (suffix (if cmd
+		   (<cmd-suffix>)
+		   (result nil))))
+    (let
+	((assignments
+	  (loop for item in prefix
+	     when (eql (car item) :assignment)
+	     collect (cadadr item)))
+	 (redirects
+	  (append
+	   (loop for item in prefix
+	      when (eql (car item) :io-redirect)
+	      collect (second item))
+	   (loop for item in suffix
+	      when (eql (car item) :io-redirect)
+	      collect (second item))))
+	 (other-words
+	  (loop for item in suffix
+	     when (eql (car item) :word)
+	     collect (second item))))
+					;(format t "~S~%" prefix)
+					;(if cmd
+      (result `(plush::simple-command
+		(plush::expand-word-list (quote ,(append (cdr cmd) other-words)))
+		
+		(quote ,redirects)
+		(plush::expand-word-list (quote ,assignments)
+					 :split-fields nil
+					 :variable-assignment t))))))
+	  ;(result `(plush::set-vars (quote ,assignments)))))))
+
+(defun <cmd-prefix> (&optional alias-mode)
+  (zero-or-more
+   (=or
+    (<io-redirect> alias-mode)
+    (<assignment-word> alias-mode))))
+
+(defun <assignment-word> (&optional alias-mode)
+  (=let*
+      ((word (<word> nil alias-mode)))
+    (if
+     (let ((pos (position #\= (second word))))
+     (and pos
+	  (not (char= (elt (second word) 0) #\=))
+	  (handler-case
+	      (esrap:parse 'plush-token::posix-name (second word) :end pos)
+	    (t nil))))
+     (result
+      (if alias-mode
+	  (list word)
+	  (list :assignment word)))
+     (fail))))
+      
+(defun <cmd-suffix> ()
+  (zero-or-more
+   (=or
+    (<io-redirect>)
+    (<word>))))
+
+(defun <redirect-list> ()
+  (=let* ((list (one-or-more (<io-redirect>))))
+    (result (mapcar #'second list))))
+
+(defun <io-redirect> (&optional alias-mode)
+  (=let*
+      ((number (maybe (=satisfies (lambda (x) (eql (car x) :io-number)))))
+       (to
+	(=or
+	 (<io-file> (second number) alias-mode)
+	 (tracer "IOHERE"
+	 (<io-here> (second number) alias-mode)))))
+    (result 
+     (if alias-mode
+	 (append number to)
+	 (list :io-redirect to)))))
+
+(defun <io-file> (number &optional alias-mode)
+  (=let*
+      ((op
+	(=or
+	 (op "<")
+	 (op "<&")
+	 (op ">")
+	 (op ">&")
+	 (op ">>")
+	 (op "<>")
+	 (op ">|")))
+       (filename (<word> nil alias-mode)))
+    (result
+     (if alias-mode
+	 (list op filename)
+	 (list :io-file (car op) (second filename)
+	       (when number (parse-integer number)))))))
+
+(defun <io-here> (number &optional alias-mode)
+  (=let*
+      ((op
+	(=or
+	 (op "<<")
+	 (op "<<-")))
+       (here-end (<word> nil alias-mode)))
+    (result
+     (if alias-mode
+	 (list op here-end)
+	 `(:io-here ,(car op)
+		    (,(plush::unquote (second here-end))
+		      ,(if (string= (plush::unquote (second here-end))
+				    (second here-end))
+			   (list 'plush::expand-here-doc
+				 (second (third op)))
+			   (second (third op))))
+		    ,(when number (parse-integer number)))))))
+
+(defun <newline> ()
+   (=satisfies (lambda (x) (eql (car x) :newline))))
+
+(defun <newline-list> ()
+  (one-or-more
+   (<newline>)))
+
+(defun <linebreak> ()
+  (maybe (<newline-list>)))
+
+(defun <separator-op> ()
+    (=or
+     (op "&")
+     (op ";")))
+
+(defun <separator> ()
+  (=or
+   (=prog1
+    (<separator-op>)
+    (<linebreak>))
+   (<newline-list>)))
+
+(defun <sequential-sep> ()
+  (=or
+   (=prog1
+    (op ";")
+    (<linebreak>))
+   (<newline-list>)))
+
+(defun op (op)
+  (=satisfies
+   (compose
+    (curry #'eql (make-keyword (string op)))
+    #'car)))
+
+(defun rword (word)
+  (=let*
+      ((rword (=satisfies
+	       (lambda (x)
+		 (and
+		  (eql (car x) :token)
+		  (string= (string-downcase (symbol-name word)) (second x)))))))
+    (result (make-keyword (string-upcase (second rword))))))
+
+(defun <and-if> ()
+  (=satisfies (compose (curry #'eql :&&) #'car) ))
+
+(defun <open-paren> ()
+  (=satisfies (compose (curry #'eql :\() #'car) ))
+
+(defun <close-paren> ()
+  (=satisfies (compose (curry #'eql :\)) #'car) ))
+
+(defun <vbar> ()
+  (=satisfies (compose (curry #'eql :\|) #'car) ))
+
+(defun <or-if> ()
+  (=satisfies (compose (curry #'eql :\|\|) #'car) ))
+    
+#+(or)(defun get-another-command (rest)
+  (destructuring-bind (&optional result) 
+      (funcall (<complete-command> nil) rest)
+    (when result
+	(values (car result)
+		(cdr result)))))
+
+(defun parse-one-command (input)
+  (let* ((source (make-token-source :parser 'plush-token::posix-token
+				    :input input))
+	 (parsed-input (funcall (<complete-command> nil) source)))
+    (if parsed-input
+	(destructuring-bind ((parsed . rest)) parsed-input
+	  (values parsed (token-source-position rest)))
+	(error (make-condition 'posix-parse-failed :format-control "Failed to parse")))))
+	
+  
+(defun parse-posix-stuff (input)
+  (let* ((source (make-token-source :parser 'plush-token::posix-token
+				  :input input)))
+    (loop
+       for input  = source then rest
+       for parsed-input = (funcall (<complete-command> nil) input)
+	 for ((result . rest)) = parsed-input
+	 ;do (format *error-output* "~A" parsed-input)
+	 when (not parsed-input)
+	 do (error (make-condition 'posix-parse-failed :format-control "Failed to parse"))
+	 append result
+	 while (not (smug::input-empty-p rest)))))

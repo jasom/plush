@@ -1,8 +1,13 @@
 ;;;; package.lisp
 
+(defpackage #:plush-token
+  (:use #:cl
+        #:esrap
+        #:alexandria))
+
 (defpackage #:plush-parser
   (:use #:cl
-	#:smug
+        #:smug
 	#:alexandria
 	#:split-sequence))
 
