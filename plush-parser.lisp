@@ -4,24 +4,31 @@
 
 (define-condition eof-when-tokenizing (simple-error) ())
 
+#+(or)
+(progn
+  (eval-when (:compile-toplevel :load-toplevel :execute)
+    (asdf:load-system :printv))
+  (defmacro printv (arg)
+    `(printv:printv ,arg)))
+#-(or)
+(defmacro printv (arg)
+  arg)
 
-(defparameter *newline-skip* 0
-  "Number of characters to skip when next newline is encountered
 
-This must be reinitilized to the fifth value of the token list when
-retokenizing (e.g. after an alias is expanded))
+(defparameter *newline-skip-list* (list (cons 0 0)))
 
-To see why,consider:
+(defun update-newline-skip (position value)
+  (setf *newline-skip-list*
+	(acons position value
+	       (delete-if (lambda (x) (>= x position))
+			  *newline-skip-list* :key #'car))))
 
-    foo <<EOF; someAlias <<EOF
-    a
-    EOF
-    b
-    EOF
+(defun get-newline-skip-for-position (pos)
+  (loop for (position . value)
+       in *newline-skip-list*
+       when (<= position pos) return value))
 
-someAlias will tokenize as (:token \"someAlias\" 11 19 5) since we
-need to skip 5 characters to consume the first here document.  So when
-we alias expand someAlias and restart the tokenizing from there, it is necessary to set *newline-skip* to 5")
+
 
 
 (defrule eof-token 
@@ -39,40 +46,41 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 (defun not-newline (char)
   (char/= #\Newline char))
 
-;TODO esrap set newline-=skip
+;TODO esrap set newline-skip
 (defun here-doc-internal (input start end)
   ;(format t "HDI: ~a ~a ~a~%" input start end)
   (multiple-value-bind (word word-end info)
     (esrap:parse 'posix-word input :start start :end end :junk-allowed t)
       (declare (ignorable info))
     ;(format t "HDI: ~a ~a ~a~%" word word-end info)
-    (if (= word-end start)
-      (values nil nil "Error parsing here-doc")
-      (multiple-value-bind
-	    (doc newend success)
-	     (esrap:parse
-	      `(and
-		(* (and (! #\Newline) character))
-		#\Newline
-		(string ,*newline-skip*)
-		(*
-		 (and
-		  (! ,(concatenate 'string
-				  '(#\Newline)
-				  (second word)))
-		  character))
-		,(concatenate 'string
-			      '(#\Newline)
-			      (second word)))
-	      input
-	      :start word-end :end end :junk-allowed t)
-	(declare (ignore newend) (type))
-	;(format t "HDI: ~a ~a ~a~%" doc newend success)
-	(if (not (eql t success))
-	    (values nil nil "Error parsing here-doc")
-	    (let ((text (text (nthcdr 3 doc))))
-	      (incf *newline-skip* (length text))
-	      (values (list :here-doc (subseq text 0 (- (length text) (1+ (length word))))) end t))))
+      (if (or (null word-end)
+	      (= word-end start))
+	  (values nil start "Error parsing here-doc")
+	  (multiple-value-bind
+		(doc newend success)
+	      (esrap:parse
+	       `(and
+		 (* (and (! #\Newline) character))
+		 #\Newline
+		 (string ,(get-newline-skip-for-position start))
+		 (*
+		  (and
+		   (! ,(concatenate 'string
+				    '(#\Newline)
+				    (second word)))
+		   character))
+		 ,(concatenate 'string
+			       '(#\Newline)
+			       (second word)))
+	       input
+	       :start word-end :end end :junk-allowed t)
+	    (declare (ignore newend) (type))
+					;(format t "HDI: ~a ~a ~a~%" doc newend success)
+	    (if (not (eql t success))
+		(values nil start "Error parsing here-doc")
+		(let ((text (text (nthcdr 3 doc))))
+		  (update-newline-skip (1+ start) (+ (get-newline-skip-for-position start) (length text)))
+		  (values (list :here-doc (subseq text 0 (- (length text) (1+ (length word)))) (length text)) end t))))
 	  )))
 
     
@@ -86,7 +94,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 (defrule here-doc-op
      (and
        (or "<<-" "<<")
-       (? here-doc-reader))
+       here-doc-reader)
      (:destructure (op doc)
                    (list (make-keyword op) op doc)))
 
@@ -115,8 +123,13 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 
 (defun newline-skip (input start end)
   (declare (ignorable input))
-  (when (>= end (+ start *newline-skip*))
-   (values nil (+ start (shiftf *newline-skip* 0)) t)))
+  (printv (get-newline-skip-for-position start))
+  (let ((skip (get-newline-skip-for-position start)))
+    (update-newline-skip (+ start skip) 0)
+    (if
+     (>= end (+ start skip))
+     (values nil (+ start skip) t)
+     (values nil start))))
 
 (defrule newline-token
          (and #\Newline
@@ -304,7 +317,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
     eof-token
     posix-word)
   (:lambda (x &bounds start end)
-    (append x (list start end *newline-skip*))))
+    (append x (list start end 0))))
 
 (defrule posix-token
   (and
@@ -596,7 +609,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
       do-command-expansion
       do-parameter-expansion
       do-backslash-expansion
-      charater))
+      character))
   (:lambda (rest)
     (join-strings-preserving-lists
      rest)))
@@ -1004,7 +1017,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 		 ,(intern (format nil "~:@(<operator-~a>~)"
 				  item))
 		 (,(intern (format nil "~:@(operator-~a-p~)" item))
-		    operator-token)
+		    posix-token)
 	       (:identity t))))
    
 
@@ -1020,7 +1033,10 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 		,(intern (format nil "~:@(reserved-~a-p~)" item))
 		(token)
 	      (when
-		  (string= (second token) ,item)
+		  (and
+		   (or (eql (car token) :word)
+		       (eql (car token) :token))
+		   (string= (second token) ,item))
 		token))
 	   collect
 	   `(esrap:defrule
@@ -1030,7 +1046,6 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 	      (:constant
 		,(make-keyword (string-upcase item))))))
 
-(defparameter *newline-skip* 0)
     
 #+(or)(defun tracer (string parser)
   (lambda (input)
@@ -1184,7 +1199,6 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
      <command>)
   (:destructure
    (stuff last)
-     (format t "~&STUFF: ~S, LAST:~S~%" stuff last)
    `(plush::run-pipe
      ,@(mapcar #'car stuff)
      ,last)))
@@ -1239,8 +1253,10 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
   (:destructure
    (_ stuff)
    (declare (ignore _))
-   (let ((stuff (butlast stuff))
+   (let ((stuff (car (butlast stuff)))
 	 (last (car (last stuff))))
+   (printv stuff)
+   (printv last)
      (convert-maybe-async-list
       (if last
 	  (collect-list-and-separators stuff last)
@@ -1287,7 +1303,9 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 (defun reserved-word-p (token)
   (when
       (and
-       (eql (car token) :token)
+       (or
+	(eql (car token) :token)
+	(eql (car token) :word))
        (member (second token) +reserved-words+ :test #'equal))
     token))
 
@@ -1379,6 +1397,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
   (:destructure
    (if if-part then then-part else-part fi)
    (declare (ignore if then fi))
+   (printv (values if-part then-part else-part))
    `(plush::posix-if ,`(quote ,if-part)
 		     ,`(quote ,then-part)
 		     ,`(quote ,else-part))))
@@ -1407,7 +1426,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
     (?
      (and <rword-else>
 	  <compound-list>))
-  (:identity t))
+  (:function second))
 
 (defrule <while-until-clause>
     (and
@@ -1472,23 +1491,20 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 (defun alias-command-fn (input start end)
   (let
       ((stuff
-	(let ((*preserve-words-as-tokens* t))
+	(let (
+	      (*preserve-words-as-tokens* t))
 	  (esrap:parse
 	   '<cmd-helper> input :start start :end end :junk-allowed t))))
-    (when stuff
+    (if stuff
       (let* ((prefix (car stuff))
-	     (cmd (cdr stuff))
+	     (cmd (cadr stuff))
 	     (alias (and (not (member (second cmd) *alias-stack* :test #'string=))
 			 (plush::alias-substitute (second cmd)))))
 	(if alias
 	  (let ((backtrack-to start)
-		  (newline-skip
-		   (or
-		    (and prefix (fifth (car prefix)))
-		    (fifth cmd)))
+		  (newline-skip (get-newline-skip-for-position start))
 		  (cmd-start (third cmd))
 		  (cmd-end (fourth cmd)))
-	      (setf *newline-skip* newline-skip)
 	      (let ((*alias-stack*
 		     (cons (second cmd) *alias-stack*)))
 		(destructuring-bind
@@ -1496,22 +1512,24 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 			     &aux (success
 				   (or (and (eql info :not-set) (> next 0))
 				       (eql info t))))
-		    (multiple-value-list
-		     (esrap::parse '<command>
-				   (concatenate 'string
-						(subseq input
-							backtrack-to cmd-start)
-						alias
-						(subseq input
-							cmd-end))
-				   :junk-allowed t))
+		    (let ((*newline-skip-list* (list (cons 0 newline-skip))))
+		      (multiple-value-list
+		       (esrap::parse '<command>
+				     (concatenate 'string
+						  (subseq input
+							  backtrack-to cmd-start)
+						  alias
+						  (subseq input
+							  cmd-end))
+				     :junk-allowed t)))
 		  
 		  (if success
 		      (values stuff
 			      (- (+ next backtrack-to (- cmd-end cmd-start)) (length alias))
 			      t)
 		      (values nil 0)))))
-	  (values nil start))))))
+	  (values nil start)))
+      (values nil start))))
 
 (defrule <simple-command>
     (or
@@ -1627,11 +1645,21 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
      (or
       <operator-<<>
       <operator-<<->)
-     <word>))
+     <word>)
+  (:destructure
+   (op here-end)
+    `(:io-here ,(car op)
+	       (,(plush::unquote (second here-end))
+		 ,(if (string= (plush::unquote (second here-end))
+			       (second here-end))
+		      `(plush::expand-here-doc
+			    ,(second (third op)))
+		      (second (third op)))))))
 
 (defrule <newline>
     newline-token
-  (:identity t))
+  (:lambda (x)
+    x))
 
 (defrule <newline-list>
     (+ <newline>)
@@ -1646,7 +1674,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 
 (defrule <separator-op>
     (separator-op-p
-     operator-token))
+     posix-token))
 
 (defrule <separator>
     (or
@@ -1683,12 +1711,14 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 	(error (make-condition 'posix-parse-failed :format-control "Failed to parse")))))
   
 (defun parse-posix-stuff (input &optional (start 0))
-  (loop
-     for position  = start then rest
-     for (result rest ) =
-       (multiple-value-list (esrap:parse '<complete-command> input :start position :junk-allowed t))
+  (let  ((*newline-skip-list* (list (cons 0 0))))
+    (loop
+       for position  = start then rest
+       for (result rest ) =
+	 (multiple-value-list (esrap:parse '<complete-command> input :start position :junk-allowed t))
 					;do (format *error-output* "~A" parsed-input)
-     when (not result)
-     do (error (make-condition 'posix-parse-failed :format-control "Failed to parse"))
-     while (and rest (not (eql (car result) :eof)))
-     append result))
+					;do (format t "~&RESULT: ~s~%" result)
+       when (not result)
+       do (error (make-condition 'posix-parse-failed :format-control "Failed to parse"))
+       append result
+       while (and rest (not (eql (car result) :eof))))))

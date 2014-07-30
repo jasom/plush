@@ -409,12 +409,10 @@
   (warn "STUB: remove-tabs")
   stuff)
 
-;TODO stub
 ;TODO respect noclobber flag
 (defun do-redirects (redirects &optional save)
   (loop for (type op stuff fd-raw) in redirects
      for fd = (or fd-raw (fd-from-op op))
-       for expanded-stuff =(unquote (car (first-expand-word stuff nil t)))
      ;when (null fd) do (setf fd (fd-from-op op))
      ;do (format t "~&FD-IN_REDIRECT: ~S ~S ~S~%" fd-raw fd op)
      when save
@@ -423,15 +421,16 @@
      end
      when (eq type :io-file)
      do 
-       (if (member op '(:<& :>&))
-	   (if (string= expanded-stuff "-")
-	       (handler-case (isys:close fd)
-		 (isys:ebadf () (values)))
-	       (isys:dup2 (parse-integer stuff) fd))
-	   (let* (
-		  (newfd (isys:open expanded-stuff (flags-from-op op))))
-	     (isys:dup2 newfd fd)
-	     (isys:close newfd)))
+       (let ((expanded-stuff (unquote (car (first-expand-word stuff nil t)))))
+	 (if (member op '(:<& :>&))
+	     (if (string= expanded-stuff "-")
+		 (handler-case (isys:close fd)
+		   (isys:ebadf () (values)))
+		 (isys:dup2 (parse-integer stuff) fd))
+	     (let* (
+		    (newfd (isys:open expanded-stuff (flags-from-op op))))
+	       (isys:dup2 newfd fd)
+	       (isys:close newfd))))
      else
      do (with-temp-fd (newfd fname)
 	  (isys:dup2 newfd fd)
@@ -545,9 +544,8 @@
 	    (make-program-command (iolib/pathnames:file-path-namestring cmd)
 				  words assignments redirects))))
     (t
-     (format *error-output* "Unable to locate ~A~%(Path: %~A)"
-	     (car words)
-	     (iolib/os:environment-variable "PATH"))
+     (format *error-output* "Unable to locate ~A~%"
+	     (car words))
      (lambda (&key &allow-other-keys)
        127)))))
 
@@ -691,8 +689,8 @@
 (defun first-expand-word (word vas split)
   (declare (ignorable split))
   (esrap::parse (if vas
-		    'plush-token::expand-word-parser-assignment
-		    'plush-token::expand-word-parser) word))
+		    'plush-parser::expand-word-parser-assignment
+		    'plush-parser::expand-word-parser) word))
   ;(smug:run (plush-parser::expand-word-parser vas) word))
 
 (defun expand-here-doc (doc)
@@ -731,7 +729,7 @@
 
 
 (defun glob-to-pcre (glob)
-  (esrap::parse 'plush-token::glob-parser glob))
+  (esrap::parse 'plush-parser::glob-parser glob))
   ;(caar (funcall (plush-parser::glob-parser) glob)))
 
 (defun match-one-glob (directory glob)
@@ -863,7 +861,7 @@
 		    (not (string= line ""))
 		    (not (char= (char sofar (- (length sofar) 2)) #\\))
 		    (handler-case (plush-parser::parse-posix-stuff sofar)
-		      (plush-token::eof-when-tokenizing nil)
+		      (plush-parser::eof-when-tokenizing nil)
 			  (plush-parser::posix-parse-failed nil)))))
 	    (when it (return (values it (+ lineno linecount)))))))
 
