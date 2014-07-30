@@ -87,7 +87,7 @@
   (aliases (make-hash-table :test #'equal) :type hash-table)
   (last-returnval 0 :type fixnum)
   (last-bg-pid nil :type (or null fixnum))
-  (bg-jobs nil :type list))
+  (bg-jobs (make-hash-table) :type hash-table))
   
 (defparameter *current-shell-environment* (make-shell-environment))
 
@@ -159,7 +159,7 @@
 
 (defun jobs-command (ut)
   ;TODO add -l and -p support
-  (loop for item in (se-bg-jobs *current-shell-environment*)
+  (loop for item being each hash-key in (se-bg-jobs *current-shell-environment*)
        do (format t "~A~%" item))
   0)
 
@@ -459,6 +459,7 @@
      do (isys:dup2 from to)
      do (isys:close from)))
      
+;TODO copy shell environment properly
 (defmethod run-command ((command program-command) &key subshell)
   (let ((pid (if subshell 0 (isys:fork))))
     (when (= pid 0)
@@ -559,19 +560,37 @@
      (cond
        ((= pid 0)
 	(init-subshell)
-	(progn ,@b))
+	(progn ,@b)
+	(isys:exit (se-last-returnval *current-shell-environment*)))
        (t
 	(if ,wait
 	  (nth-value 1 (isys:waitpid pid 0))
 	  pid)))))
 
 (defmacro asynchronous-cmd (&body b)
-    `(push
-      (setf (se-last-bg-pid *current-shell-environment*)
-	    (with-subshell ()
-	      (isys:setpgid 0 0)
-	      ,@b))
-      (se-bg-jobs *current-shell-environment*)))
+  (with-gensyms (job-id pid)
+    `(let ((,job-id
+	    (loop for i from 1
+	       when (not (gethash i (se-bg-jobs *current-shell-environment*) nil))
+	       return i))
+	   (,pid (with-subshell ()
+		   (isys:setpgid 0 0)
+		   ,@b)))
+       (setf (se-last-bg-pid *current-shell-environment*) ,pid
+	     (gethash ,job-id (se-bg-jobs *current-shell-environment*)) ,pid))))
+
+(defun reap-children (se)
+  (loop for (job-id . pid) in (hash-table-alist (se-bg-jobs se))
+     for stat = (and pid (isys:waitpid pid isys:wnohang))
+     if stat
+     do
+       (cond
+	 ((isys:wifexited stat)
+	  (format t "[~D]+  Done~%" job-id)
+	  (remhash job-id (se-bg-jobs se)))
+	 ((isys:wifsignaled stat)
+	  (format t "[~D]+  Terminated~%" job-id)
+	  (remhash job-id (se-bg-jobs se))))))
 
 (defun run-with-pipe (cmd stdin stdout subshell)
   (unwind-protect
@@ -670,6 +689,7 @@
      finally (return nil)))
 
 (defun first-expand-word (word vas split)
+  (declare (ignorable split))
   (esrap::parse (if vas
 		    'plush-token::expand-word-parser-assignment
 		    'plush-token::expand-word-parser) word))
@@ -677,7 +697,7 @@
 
 (defun expand-here-doc (doc)
   (apply 'concatenate 'string
-  (smug:run (plush-parser::expand-here-doc-parser) doc)))
+  (esrap:parse 'plush-parser::expand-here-doc-parser doc)))
 
 (defun first-expansions (list vas split)
   (reduce #'append
@@ -893,6 +913,8 @@
 (defclass brace-group (command)
   ((commands :initform nil :initarg :commands :accessor brace-commands)))
 
+
+
 (defmethod run-command ((cmd brace-group) &key &allow-other-keys)
   (with-redirected-io ((command-redirects cmd))
     (mapc (lambda (x) (when x) (eval x))
@@ -901,6 +923,20 @@
 
 (defun brace-group (commands)
   (make-instance 'brace-group
+		 :commands commands))
+
+(defclass subshell-group (command)
+  ((commands :initform nil :initarg :commands :accessor subshell-commands)))
+
+(defmethod run-command ((cmd subshell-group) &key &allow-other-keys)
+  (with-redirected-io ((command-redirects cmd))
+    (with-subshell (t)
+	(mapc (lambda (x) (when x) (eval x))
+	      (subshell-commands cmd))
+      (se-last-returnval *current-shell-environment*))))
+
+(defun subshell-group (commands)
+  (make-instance 'subshell-group
 		 :commands commands))
 
 (defclass for-command (command)
@@ -990,6 +1026,7 @@
 		    :patterns ,`(quote ,patterns)))
 
 (defun get-prompt ()
+  (reap-children *current-shell-environment*)
   (car (first-expand-word (get-parameter "PS1") nil nil)))
 
 (defun define-function (fname command redirects)

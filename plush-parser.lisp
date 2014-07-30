@@ -74,7 +74,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 	    (values nil nil "Error parsing here-doc")
 	    (let ((text (text (nthcdr 3 doc))))
 	      (incf *newline-skip* (length text))
-	      (values (list :here-doc (subseq text 0 (- (length text) (length word)))) end t))))
+	      (values (list :here-doc (subseq text 0 (- (length text) (1+ (length word))))) end t))))
 	  )))
 
     
@@ -1167,7 +1167,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
        (list (<compound-list> alias-stack))
        (_ (<close-paren>)))
     (result
-     (list 'plush::with-subshell '(t) list))))
+     `(plush::subshell-group ',list))))
 
 (defun <compound-list> (alias-stack )
   (=let*
