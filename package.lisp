@@ -7,7 +7,7 @@
 
 (defpackage #:plush-parser
   (:use #:cl
-        #:smug
+        #:esrap
 	#:alexandria
 	#:split-sequence))
 

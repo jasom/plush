@@ -1,4 +1,4 @@
-(in-package :plush-token)
+(in-package :plush-parser)
 
 (declaim (optimize (debug 3)))
 
@@ -38,8 +38,6 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 
 (defun not-newline (char)
   (char/= #\Newline char))
-
-
 
 ;TODO esrap set newline-=skip
 (defun here-doc-internal (input start end)
@@ -99,7 +97,7 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 
 (defrule operator-token
   (or here-doc-op
-      "&&" "||" ";;" ">>" "<&"
+      "&&" "||" ";;" ">|" ">>" "<&"
       ">&" "<>" "|" "&" ";"
       "<" ">" "(" ")")
   (:lambda (x)
@@ -984,14 +982,53 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
 	   1 0)))))
 
 |#
-(in-package :plush-parser)
+(defvar *preserve-words-as-tokens* nil)
+(defvar *alias-stack* nil)
 
 (declaim (optimize (debug 3)))
 
 (define-condition posix-parse-failed (simple-error) ())
 
+#.`(progn
+     ,@(loop for item in
+	    '("&&" "||" ";;" ">|" ">>" "<&"
+	      ">&" "<>" "|" "&" ";"
+	      "<" ">" "(" ")"
+	      "<<-" "<<")
+	    collect
+	    `(defun ,(intern (format nil "~:@(operator-~a-p~)" item)) (x)
+	       (when
+		   (eql (car x) ,(make-keyword item)) x))
+	    collect
+	    `(esrap:defrule
+		 ,(intern (format nil "~:@(<operator-~a>~)"
+				  item))
+		 (,(intern (format nil "~:@(operator-~a-p~)" item))
+		    operator-token)
+	       (:identity t))))
+   
+
 (defparameter +reserved-words+ '("if" "then" "else" "elif" "fi" "do" "done" "in"
 				 "case" "esac" "while" "until" "for" "{" "}" "!"))
+
+#.`(progn
+    ,@(loop for item in 
+       '("if" "then" "else" "elif" "fi" "do" "done" "in"
+	 "case" "esac" "while" "until" "for" "{" "}" "!")
+	   collect
+	   `(defun
+		,(intern (format nil "~:@(reserved-~a-p~)" item))
+		(token)
+	      (when
+		  (string= (second token) ,item)
+		token))
+	   collect
+	   `(esrap:defrule
+		,(intern (format nil "~:@(<rword-~a>~)" item))
+		(,(intern (format nil "~:@(reserved-~a-p~)" item))
+		  posix-token)
+	      (:constant
+		,(make-keyword (string-upcase item))))))
 
 (defparameter *newline-skip* 0)
     
@@ -1061,21 +1098,31 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
        collect (list 'plush::asynchronous-cmd cmd)
        else collect cmd))
    
-(defun <complete-command> (alias-stack)
-  (tracer "CC"
-  (=or
-   (=not (item))
-   (=satisfies (lambda (x) (and (consp x) (eql (car x) :eof))))
-   (=let* ((_ (<newline-list>)))
-     (result
-      '(())))
-   (=let*
-	((list (<list> alias-stack))
-	(op (maybe (<separator>))))
-     (let
-	 ((fixed-list (append list (list op))))
-       (result
-	(convert-maybe-async-list fixed-list)))))))
+(defrule <eof-complete-command>
+    eof-token
+  (:identity t))
+
+(defrule <newline-list-complete-command>
+    <newline-list>
+  (:constant '(())))
+
+(defrule <complete-command-internal>
+    (and
+     <list>
+     (? <separator>))
+  (:destructure
+   (list op)
+   (let
+       ((fixed-list (append list (list op))))
+      (convert-maybe-async-list fixed-list))))
+
+(defrule <complete-command>
+    (or
+     <eof-complete-command>
+     <newline-list-complete-command>
+     <complete-command-internal>)
+  (:identity t))
+
 
 (defun collect-list-and-separators (list-sep last)
   (loop for list = list-sep then (cdr list)
@@ -1084,523 +1131,564 @@ we alias expand someAlias and restart the tokenizing from there, it is necessary
        else collect last
        while list))
 
-(defun <list> (alias-stack)
-  (=let*
-      ((first (<and-or> alias-stack))
-       (rest
-	(zero-or-more
-	 (=let* ((op (<separator-op>))
-		 (andor (<and-or> alias-stack)))
-	   (result (list op andor))))))
-    (result (cons first (reduce #'append rest)))))
+;TODO alias-stack
+(esrap:defrule <list>
+    (and
+     <and-or>
+     (*
+      (and
+       <separator-op>
+       <and-or>)))
+  (:destructure
+   (first rest)
+      (cons first (reduce #'append rest))))
+      
+(esrap:defrule <and-or>
+    (and
+     (*
+      (and <pipeline>
+	   (or <and-if>
+	       <or-if>)
+	   <linebreak>))
+     <pipeline>)
+  (:destructure
+   (conditionals last)
+   (reduce (lambda (x y)
+	     (destructuring-bind (pipe op _) x 
+	       (declare (ignore _))
+	       (if
+		(eql (car op) :&&)
+		(list 'plush::shell-and pipe y)
+		(list 'plush::shell-or pipe y))))
+	   conditionals
+	   :from-end t :initial-value last)))
 
-(defun <and-or> (alias-stack)
-  (=let*
-      ((conditionals
-	(zero-or-more
-	 (=let*
-	     ((pipe (<pipeline> alias-stack))
-	      (op
-	       (=or (<and-if>)
-		    (<or-if>)))
-	      (_ (<linebreak>)))
-	   (result
-	    (list pipe op)))))
-       (last (<pipeline> alias-stack)))
-    (result
-     (reduce (lambda (x y)
-	       (destructuring-bind (pipe op) x
-		 (if
-		  (eql (car op) :&&)
-		       (list 'plush::shell-and pipe y)
-		       (list 'plush::shell-or pipe y))))
-		  conditionals
-	       :from-end t :initial-value last))))
 
-(defun <pipeline> (alias-stack)
-    (=let*
-	((bang (maybe (rword :!)))
-	 (sequence (<pipe-sequence> alias-stack)))
-      (result
-       (if bang
-	   `(plush::invert-result ,sequence)
-	   sequence))))
+(esrap:defrule <pipeline>
+  (and
+   (? (reserved-!-p posix-word ))
+   <pipe-sequence>)
+  (:destructure
+   (bang sequence)
+   (if bang
+       `(plush::invert-result ,sequence)
+       sequence)))
 
-(defun <pipe-sequence> (alias-stack)
-  (=let*
-      ((stuff
-	(zero-or-more
-	 (=prog1
-	  (<command> alias-stack)
-	  (<vbar>)
-	  (<linebreak>))))
-       (last (<command> alias-stack)))
-    (result
-     `(plush::run-pipe
-	     ,@stuff
-	     ,last))))
+(esrap:defrule <pipe-sequence>
+    (and
+     (*
+      (and
+       <command>
+       <vbar>
+       <linebreak>))
+     <command>)
+  (:destructure
+   (stuff last)
+     (format t "~&STUFF: ~S, LAST:~S~%" stuff last)
+   `(plush::run-pipe
+     ,@(mapcar #'car stuff)
+     ,last)))
 
-(defun <command> (alias-stack)
-  (=or
-   (<function-definition> alias-stack)
-   (<simple-command> alias-stack)
-   (=let*
-       ((cmd (<compound-command> alias-stack))
-	(redir (maybe (<redirect-list>))))
-     (result `(plush::compound-command ,cmd ',redir)))))
+(defrule <compound-command-and-redirect>
+    (and
+     <compound-command>
+     <redirect-list>)
+  (:destructure
+   (cmd redir)
+   `(plush::compound-command ,cmd ',redir)))
 
-(defun <compound-command> (alias-stack)
-  (=let*
-      ((cmd
-	(=or (<brace-group> alias-stack)
-	     (<subshell> alias-stack)
-	     (<for-clause> alias-stack)
-	     (<case-clause> alias-stack)
-	     (<if-clause> alias-stack)
-	     (<while-until-clause> alias-stack))))
-    (result
-     cmd)))
+(defrule <command>
+    (or
+     <function-definition>
+     <simple-command>
+     <compound-command-and-redirect>)
+  (:identity t))
+     
+(defrule <compound-command>
+    (or
+     <brace-group>
+     <subshell>
+     <for-clause>
+     <case-clause>
+     <if-clause>
+     <while-until-clause>)
+  (:identity t))
 
-(defun <subshell> (alias-stack)
-  (=let*
-      ((_ (<open-paren>))
-       (list (<compound-list> alias-stack))
-       (_ (<close-paren>)))
-    (result
-     `(plush::subshell-group ',list))))
-
-(defun <compound-list> (alias-stack )
-  (=let*
-      ((_ (maybe (<newline-list>)))
-       (stuff
-	(zero-or-more
-	 (=let*
-	     ((item (<and-or> alias-stack))
-	      (sep (<separator>)))
-	   (result (list item sep)))))
-       (last
-	(if (zerop (length stuff))
-	    (<and-or> alias-stack)
-	    (maybe (<and-or> alias-stack)))))
-    (result
+(defrule <subshell>
+    (and
+     <open-paren>
+     <compound-list>
+     <close-paren>)
+  (:destructure
+   (open list close)
+   (declare (ignore open close))
+   `(plush::subshell-group ',list)))
+		
+(defrule <compound-list>
+    (and
+     (? <newline-list>)
+     (or
+      (and
+       (+
+	(and
+	 <and-or>
+	 <separator>))
+       (? <and-or>))
+      (and
+       <and-or>)))
+  (:destructure
+   (_ stuff)
+   (declare (ignore _))
+   (let ((stuff (butlast stuff))
+	 (last (car (last stuff))))
      (convert-maybe-async-list
       (if last
 	  (collect-list-and-separators stuff last)
 	  (mapcan #'copy-list stuff))))))
 
-(defun <for-clause> (alias-stack)
-  (=let*
-      ((_ (rword :for))
-       (name (<name>))
-       (_ (<linebreak>))
-       (in (maybe (rword :in)))
-       (wordlist
-	(if in
-	    (maybe (<wordlist>))
-	    (result nil)))
-       (_ (if in (<sequential-sep>)
-	      (result t)))
-       (do-group (<do-group> alias-stack)))
-    (let
-	((wordlist (if in wordlist '("$@"))))
-      (result
-       `(plush::posix-for ,(second name) (plush::expand-word-list ,`(quote ,wordlist)) ,`(quote ,do-group))))))
+(defrule <for-clause>
+    (and
+     (reserved-for-p posix-word)
+     <name>
+     <linebreak>
+     (?
+      (and
+       (reserved-in-p posix-token)
+       (? <wordlist>)
+       <sequential-sep>))
+     <do-group>)
+  (:destructure
+   (for name lb in do-group)
+   (declare (ignore for lb))
+   (let ((wordlist
+	  (if in
+	      (second in)
+	      "\"$@\"")))
+     `(plush::posix-for ,(second name) (plush::expand-word-list ,`(quote ,wordlist)) ,`(quote ,do-group)))))
 
-(defun <name> ()
-  (=let*
-   ((name (=satisfies (lambda (x)
-			(and (eql :token (car x))
-			     (handler-case
-				 (esrap:parse 'plush-token::posix-name (second x))
-			       (t nil)))))))
-    (result (list :name (second name)))))
+(defun posix-name-p (token)
+  (when
+      (and (eql :token (car token))
+	   (handler-case
+	       (esrap:parse 'posix-name (second token))
+	     (t nil)))
+    token))
 
+(defrule <name>
+    (posix-name-p posix-token)
+  (:lambda (x)
+    (list :name (second x))))
+    
+(defrule <wordlist>
+    (+ <word>)
+  (:lambda (words)
+    (mapcar #'second words)))
 
-(defun <wordlist> ()
-  (=let* ((words (one-or-more (<word>))))
-    (result (mapcar #'second words))))
+(defun reserved-word-p (token)
+  (when
+      (and
+       (eql (car token) :token)
+       (member (second token) +reserved-words+ :test #'equal))
+    token))
 
-(defun <word> (&optional disallowed-rsvd alias-mode)
-  (=let*
-      ((word (=satisfies (compose (curry #'eql :token) #'car))))
-    (if
-     (member (second word) disallowed-rsvd :test #'string=)
-     (fail)
-     (result (if alias-mode
-		 word
-		 (list :word (second word)))))))
+(defun not-reserved-word-p (token)
+  (when
+      (not (reserved-word-p token))
+    token))
 
-(defun <case-clause> ( alias-stack)
-  (=let*
-      ((_ (rword :case))
-       (word (<word>))
-       (_ (<linebreak>))
-       (_ (rword :in))
-       (_ (<linebreak>))
-       (stuff
-	(zero-or-more
-	 (=let*
-	     ((_ (maybe (op #\()))
-	      (pattern (<pattern>))
-	      (_ (op #\)))
-	      (meat (=or
-		     (<compound-list> alias-stack)
-		     (<linebreak>)))
-	      (_ (op ";;"))
-	      (_ (<linebreak>)))
-	   (result (list pattern meat)))))
-       (last
-	(maybe
-	 (=let*
-	     ((_ (maybe (op #\()))
-	      (pattern (<pattern>))
-	      (_ (op #\)))
-	      (meat (maybe (<compound-list> alias-stack)))
-	      (_ (<linebreak>)))
-	   (result (list pattern meat)))))
-       (_ (rword :esac)))
-    (result
-     `(plush::posix-case ,(second word) ,@stuff ,@(when last `(,last))))))
+(defun wordp (token)
+  (when
+      (eql (car token) :token)
+    token))
 
-(defun <pattern> ()
-  (=let*
-      ((_ (=not (rword :esac)))
-       (first (<word>))
-       (rest
-	(zero-or-more
-	 (=and
-	  (op "|")
-	  (<word>)))))
-    (result
-     (mapcar #'second (cons first rest)))))
+(defrule <word-norsvd>
+    (not-reserved-word-p <word>))
 
-(defun <if-clause> (alias-stack)
-  (=let*
-      ((_ (rword :if))
-       (if-part (<compound-list> alias-stack))
-       (_ (rword :then))
-       (then-part (<compound-list> alias-stack))
-       (else-part (<else-part> alias-stack))
-       (_ (rword :fi)))
-    (result `(plush::posix-if ,`(quote ,if-part)
-			      ,`(quote ,then-part)
-			      ,`(quote ,else-part)))))
+(defrule <word>
+    (wordp posix-token)
+  (:lambda (word)
+    (if *preserve-words-as-tokens*
+	word
+	(list :word (second word)))))
 
-(defun <else-part> (alias-stack)
-  (=or
-   (=let*
-       ((_ (rword :elif))
-	(elif-part (<compound-list> alias-stack))
-	(_ (rword :then))
-	(then-part (<compound-list> alias-stack))
-	(else-part (<else-part> alias-stack)))
-     (result `((plush::run-pipe
-		(plush::posix-if ,`(quote ,elif-part)
-			       ,`(quote ,then-part)
-			       ,`(quote ,else-part))))))
-   (=let*
-       ((else
-	 (maybe
-	  (=and
-	   (rword :else)
-	   (<compound-list> alias-stack)))))
-     (result 
-      else))))
+(defrule <case-subclause>
+    (and
+     (? <operator-\(>)
+     <pattern>
+     <operator-\)>
+     (or
+      <compound-list>
+      <linebreak>)
+     <operator-|;;|>
+     <linebreak>)
+     (:destructure
+      (open pattern close meat sep lb)
+      (declare (ignore open close sep lb))
+      (list pattern meat)))
 
-(defun <while-until-clause> (alias-stack)
-  (=let*
-      ((type
-	(=or
-	 (rword :while)
-	 (rword :until)))
-       (while (<compound-list> alias-stack))
-       (do (<do-group> alias-stack)))
-    (result `(plush::posix-while-until ,`',while ,`',do ,(eql type :until)))))
+(defrule <last-case-subclause>
+    (and
+     (? <operator-\(>)
+     <pattern>
+     <operator-\)>
+     <compound-list>
+     <linebreak>)
+  (:destructure
+   (open pattern close meat lb)
+   (declare (ignore open close lb))
+   (list pattern meat)))
 
-(defun <function-definition> (alias-stack)
-  (=let*
-      ((fname (tracer "FNAME" (<name>)))
-       (_ (op "("))
-       (_ (op ")"))
-       (_ (<linebreak>))
-       (body (tracer "FBODY" (<compound-command> alias-stack)))
-       (redirect (maybe (<redirect-list>))))
-    (result `(plush::define-function ,(second fname) ',body ',redirect))))
+(defrule <case-clause>
+    (and
+     (reserved-case-p posix-token)
+     <word>
+     <linebreak>
+     (reserved-in-p posix-token)
+     <linebreak>
+     (* <case-subclause>)
+     (? <last-case-subclause>))
+  (:destructure
+   (case word lb in lb2 stuff last)
+   (declare (ignore case lb in lb2))
+   `(plush::posix-case ,(second word) ,@stuff ,@(when last `(,last)))))
 
-(defun <brace-group> (alias-stack)
-  (=let*
-      ((_ (rword :{))
-       (cmd (<compound-list> alias-stack))
-       (_ (rword :})))
-    (result `(plush::brace-group ',cmd))))
+(defun not-reserved-esac-p (token)
+  (when
+      (not (reserved-esac-p token))
+    token))
 
-(defun <do-group> (alias-stack)
-  (=prog2
-   (rword :do)
-   (<compound-list> alias-stack)
-   (rword :done)))
+(defrule <pattern>
+    (and
+     (not-reserved-esac-p <word>)
+     (*
+      (and
+       <operator-\|>
+       <word>)))
+  (:destructure
+   (first rest)
+   (mapcar #'second (cons first rest))))
+   
+(defrule <if-clause>
+    (and
+     (reserved-if-p posix-token)
+     <compound-list>
+     (reserved-then-p posix-token)
+     <compound-list>
+     <else-part>
+     (reserved-fi-p posix-token))
+  (:destructure
+   (if if-part then then-part else-part fi)
+   (declare (ignore if then fi))
+   `(plush::posix-if ,`(quote ,if-part)
+		     ,`(quote ,then-part)
+		     ,`(quote ,else-part))))
+
+(defrule <else-part>
+   (or 
+    <elif-rule>
+    <else-rule>))
+
+(defrule <elif-rule>
+    (and
+     <rword-elif>
+     <compound-list>
+     <rword-then>
+     <compound-list>
+     <else-part>)
+  (:destructure
+   (elif elif-part then then-part else-part)
+   (declare (ignore elif then))
+   `((plush::run-pipe
+     (plush::posix-if ,`(quote ,elif-part)
+		      ,`(quote ,then-part)
+		      ,`(quote ,else-part))))))
+
+(defrule <else-rule>
+    (?
+     (and <rword-else>
+	  <compound-list>))
+  (:identity t))
+
+(defrule <while-until-clause>
+    (and
+     (or <rword-until>
+	 <rword-while>)
+     <compound-list>
+     <do-group>)
+  (:destructure
+   (type while do)
+   `(plush::posix-while-until ,`',while ,`',do ,(eql type :until))))
+
+(defrule <function-definition>
+    (and
+     <name>
+     <operator-\(>
+     <operator-\)>
+     <linebreak>
+     <compound-command>
+     (? <redirect-list>))
+  (:destructure
+   (fname open close lb body redirect)
+   (declare (ignore open close lb))
+   `(plush::define-function ,(second fname) ',body ',redirect))) 
+
+(defrule <brace-group>
+    (and
+     <rword-{>
+     <compound-list>
+     <rword-}>)
+  (:destructure
+   (open cmd close)
+   (declare (ignore open close))
+   `(plush::brace-group ',cmd)))
+
+(defrule <do-group>
+    (and
+     <rword-do>
+     <compound-list>
+     <rword-done>)
+  (:function second))
 
 ;;BUG TODO UGLY DAMNIT POSIX
 ;;This can backtrack, potentially across a HERE-DOC
 ;;That breaks my ugly hack for newline-skip :(
 
-(defun <alias-command> (alias-stack)
-  (lambda (input)
-    (let ((stuff (funcall
-		  (=let*
-		      ((prefix (tracer "PRE" (<cmd-prefix> t)))
-		       (cmd (if prefix
-				(maybe (<word> nil t))
-				(<word> +reserved-words+ t))))
-		    ;(format t "~%PREFIX: ~A~%" prefix)
-		    ;(format t "~%PREFIX2: ~A~%" (mapcar #'append prefix))
-		    (result (cons (reduce #'append prefix) cmd)))
-		  input)))
-      (when input
-	(let* ((prefix (caaar stuff))
-	       (cmd (cdaar stuff))
-	       (rest (cdar stuff))
-	       (input-string (token-source-input input))
-	       (alias (and (not (member (second cmd) alias-stack :test #'string=))
-			   (plush::alias-substitute (second cmd)))))
-	  (declare (ignorable rest))
-	  (if alias
-	      (let ((backtrack-to
-		     (or
-		      (and prefix (third (car prefix)))
-		      (third cmd)))
-		    (newline-skip
-		     (or
-		      (and prefix (fifth (car prefix)))
-		      (fifth cmd)))
-		    (cmd-start (third cmd))
-		    (cmd-end (fourth cmd)))
-	    (progn
-	      ;(format t "Alias-test: ~S ~S ~S~%" prefix cmd rest)
-	      (setf plush-token::*newline-skip* newline-skip)
-	      (funcall (<command> (cons (second cmd) alias-stack))
-		       (make-token-source
-			:parser (token-source-parser input)
-			:line-cache nil
-			:position 0
-			:input
-			 (concatenate 'string
-					      (subseq input-string
-						      backtrack-to cmd-start)
-					      alias
-					      (subseq input-string
-						      cmd-end))))))))))))
-      
-      
-(defun <simple-command> (alias-stack)
-  (=or (<alias-command> alias-stack)
-       (<truely-simple-command>)))
+(defun not-null (x)
+  (not (null x)))
 
-(defun <truely-simple-command> ()
-  (=let*
-      ((prefix (tracer "TS-PRE" (<cmd-prefix>)))
-       (cmd
-	(if prefix
-	    (maybe (<word>))
-	    (<word> +reserved-words+)))
-       (suffix (if cmd
-		   (<cmd-suffix>)
-		   (result nil))))
-    (let
-	((assignments
+(defrule <cmd-helper>
+    (or
+     (and
+      (not-null <cmd-prefix>)
+      (? <word>))
+     (and
+      <word-norsvd>))
+  (:lambda (x)
+    (if (= (length x) 1)
+	(cons nil x)
+	x)))
+      
+;todo expand next word when alias ends in space
+(defun alias-command-fn (input start end)
+  (let
+      ((stuff
+	(let ((*preserve-words-as-tokens* t))
+	  (esrap:parse
+	   '<cmd-helper> input :start start :end end :junk-allowed t))))
+    (when stuff
+      (let* ((prefix (car stuff))
+	     (cmd (cdr stuff))
+	     (alias (and (not (member (second cmd) *alias-stack* :test #'string=))
+			 (plush::alias-substitute (second cmd)))))
+	(if alias
+	  (let ((backtrack-to start)
+		  (newline-skip
+		   (or
+		    (and prefix (fifth (car prefix)))
+		    (fifth cmd)))
+		  (cmd-start (third cmd))
+		  (cmd-end (fourth cmd)))
+	      (setf *newline-skip* newline-skip)
+	      (let ((*alias-stack*
+		     (cons (second cmd) *alias-stack*)))
+		(destructuring-bind
+		      (stuff next &optional (info :not-set)
+			     &aux (success
+				   (or (and (eql info :not-set) (> next 0))
+				       (eql info t))))
+		    (multiple-value-list
+		     (esrap::parse '<command>
+				   (concatenate 'string
+						(subseq input
+							backtrack-to cmd-start)
+						alias
+						(subseq input
+							cmd-end))
+				   :junk-allowed t))
+		  
+		  (if success
+		      (values stuff
+			      (- (+ next backtrack-to (- cmd-end cmd-start)) (length alias))
+			      t)
+		      (values nil 0)))))
+	  (values nil start))))))
+
+(defrule <simple-command>
+    (or
+     (function alias-command-fn)
+     <truely-simple-command>)
+    (:identity t))
+
+(defun cmd-has-meat-p (cmd)
+  (when (second cmd)
+    cmd))
+
+(defrule <truely-simple-command> 
+  (or
+   (and
+    (cmd-has-meat-p <cmd-helper>)
+    <cmd-suffix>)
+   (and
+    <cmd-helper>))
+  (:destructure
+   ((prefix cmd) &optional suffix)
+   (let
+       ((assignments
+	 (loop for item in prefix
+	    when (eql (car item) :assignment)
+	    collect (cadadr item)))
+	(redirects
+	 (append
 	  (loop for item in prefix
-	     when (eql (car item) :assignment)
-	     collect (cadadr item)))
-	 (redirects
-	  (append
-	   (loop for item in prefix
-	      when (eql (car item) :io-redirect)
-	      collect (second item))
-	   (loop for item in suffix
-	      when (eql (car item) :io-redirect)
-	      collect (second item))))
-	 (other-words
+	     when (eql (car item) :io-redirect)
+	     collect (second item))
 	  (loop for item in suffix
-	     when (eql (car item) :word)
+	     when (eql (car item) :io-redirect)
 	     collect (second item))))
-					;(format t "~S~%" prefix)
-					;(if cmd
-      (result `(plush::simple-command
-		(plush::expand-word-list (quote ,(append (cdr cmd) other-words)))
-		
-		(quote ,redirects)
-		(plush::expand-word-list (quote ,assignments)
-					 :split-fields nil
-					 :variable-assignment t))))))
-	  ;(result `(plush::set-vars (quote ,assignments)))))))
+	(other-words
+	 (loop for item in suffix
+	    when (eql (car item) :word)
+	    collect (second item))))
+     `(plush::simple-command
+       (plush::expand-word-list (quote ,(append (cdr cmd) other-words)))
+       (quote ,redirects)
+       (plush::expand-word-list (quote ,assignments)
+				:split-fields nil
+				:variable-assignment t)))))
 
-(defun <cmd-prefix> (&optional alias-mode)
-  (zero-or-more
-   (=or
-    (<io-redirect> alias-mode)
-    (<assignment-word> alias-mode))))
 
-(defun <assignment-word> (&optional alias-mode)
-  (=let*
-      ((word (<word> nil alias-mode)))
-    (if
-     (let ((pos (position #\= (second word))))
+(defrule <cmd-prefix>
+    (*
+     (or
+      <io-redirect>
+      <assignment-word>))
+  (:identity t))
+
+(defun assignment-word-p (word)
+  (when
+   (let ((pos (position #\= (second word))))
      (and pos
 	  (not (char= (elt (second word) 0) #\=))
 	  (handler-case
-	      (esrap:parse 'plush-token::posix-name (second word) :end pos)
+	      (esrap:parse 'posix-name (second word) :end pos)
 	    (t nil))))
-     (result
-      (if alias-mode
-	  (list word)
-	  (list :assignment word)))
-     (fail))))
-      
-(defun <cmd-suffix> ()
-  (zero-or-more
-   (=or
-    (<io-redirect>)
-    (<word>))))
+    word))
 
-(defun <redirect-list> ()
-  (=let* ((list (one-or-more (<io-redirect>))))
-    (result (mapcar #'second list))))
+(defrule <assignment-word>
+    (assignment-word-p <word>)
+  (:lambda (word)
+    (if *preserve-words-as-tokens*
+	(list word)
+	(list :assignment word))))
 
-(defun <io-redirect> (&optional alias-mode)
-  (=let*
-      ((number (maybe (=satisfies (lambda (x) (eql (car x) :io-number)))))
-       (to
-	(=or
-	 (<io-file> (second number) alias-mode)
-	 (tracer "IOHERE"
-	 (<io-here> (second number) alias-mode)))))
-    (result 
-     (if alias-mode
-	 (append number to)
-	 (list :io-redirect to)))))
+(defrule <cmd-suffix>
+    (*
+     (or <io-redirect>
+	 <word>))
+  (:identity t))
 
-(defun <io-file> (number &optional alias-mode)
-  (=let*
-      ((op
-	(=or
-	 (op "<")
-	 (op "<&")
-	 (op ">")
-	 (op ">&")
-	 (op ">>")
-	 (op "<>")
-	 (op ">|")))
-       (filename (<word> nil alias-mode)))
-    (result
-     (if alias-mode
-	 (list op filename)
-	 (list :io-file (car op) (second filename)
-	       (when number (parse-integer number)))))))
+(defrule <redirect-list>
+    (* <io-redirect>)
+  (:lambda (list)
+    (mapcar #'second list)))
 
-(defun <io-here> (number &optional alias-mode)
-  (=let*
-      ((op
-	(=or
-	 (op "<<")
-	 (op "<<-")))
-       (here-end (<word> nil alias-mode)))
-    (result
-     (if alias-mode
-	 (list op here-end)
-	 `(:io-here ,(car op)
-		    (,(plush::unquote (second here-end))
-		      ,(if (string= (plush::unquote (second here-end))
-				    (second here-end))
-			   (list 'plush::expand-here-doc
-				 (second (third op)))
-			   (second (third op))))
-		    ,(when number (parse-integer number)))))))
+(defrule <io-redirect>
+    (and
+     (? io-number)
+     (or
+      <io-file>
+      <io-here>))
+  (:destructure
+   (number to)
+   (if *preserve-words-as-tokens*
+       (append number to)
+       (list :io-redirect
+	     (append to (list (when number (parse-integer (second number)))))))))
+		
+(defrule <io-file>
+    (and
+     (or
+      <operator-<>
+      <operator-&>
+      <operator->>
+      <operator->&>
+      <operator->>>
+      <operator-<>>
+      <operator->\|>)
+     <word>)
+  (:destructure
+   (op filename)
+   (if *preserve-words-as-tokens*
+       (list op filename)
+       (list :io-file (car op) (second filename)))))
 
-(defun <newline> ()
-   (=satisfies (lambda (x) (eql (car x) :newline))))
+(defrule <io-here>
+    (and
+     (or
+      <operator-<<>
+      <operator-<<->)
+     <word>))
 
-(defun <newline-list> ()
-  (one-or-more
-   (<newline>)))
+(defrule <newline>
+    newline-token
+  (:identity t))
 
-(defun <linebreak> ()
-  (maybe (<newline-list>)))
-
-(defun <separator-op> ()
-    (=or
-     (op "&")
-     (op ";")))
-
-(defun <separator> ()
-  (=or
-   (=prog1
-    (<separator-op>)
-    (<linebreak>))
-   (<newline-list>)))
-
-(defun <sequential-sep> ()
-  (=or
-   (=prog1
-    (op ";")
-    (<linebreak>))
-   (<newline-list>)))
-
-(defun op (op)
-  (=satisfies
-   (compose
-    (curry #'eql (make-keyword (string op)))
-    #'car)))
-
-(defun rword (word)
-  (=let*
-      ((rword (=satisfies
-	       (lambda (x)
-		 (and
-		  (eql (car x) :token)
-		  (string= (string-downcase (symbol-name word)) (second x)))))))
-    (result (make-keyword (string-upcase (second rword))))))
-
-(defun <and-if> ()
-  (=satisfies (compose (curry #'eql :&&) #'car) ))
-
-(defun <open-paren> ()
-  (=satisfies (compose (curry #'eql :\() #'car) ))
-
-(defun <close-paren> ()
-  (=satisfies (compose (curry #'eql :\)) #'car) ))
-
-(defun <vbar> ()
-  (=satisfies (compose (curry #'eql :\|) #'car) ))
-
-(defun <or-if> ()
-  (=satisfies (compose (curry #'eql :\|\|) #'car) ))
+(defrule <newline-list>
+    (+ <newline>)
+  (:identity t))
     
-#+(or)(defun get-another-command (rest)
-  (destructuring-bind (&optional result) 
-      (funcall (<complete-command> nil) rest)
-    (when result
-	(values (car result)
-		(cdr result)))))
+(defrule <linebreak>
+    (? <newline-list>))
 
-(defun parse-one-command (input)
-  (let* ((source (make-token-source :parser 'plush-token::posix-token
-				    :input input))
-	 (parsed-input (funcall (<complete-command> nil) source)))
-    (if parsed-input
-	(destructuring-bind ((parsed . rest)) parsed-input
-	  (values parsed (token-source-position rest)))
+(defun separator-op-p (x)
+    (or (operator-&-p x)
+	(operator-\;-p x)))
+
+(defrule <separator-op>
+    (separator-op-p
+     operator-token))
+
+(defrule <separator>
+    (or
+     (and <separator-op>
+	  <linebreak>)
+     (and <newline-list>))
+  (:lambda (x) (car x)))
+
+(defrule <sequential-sep>
+    (or
+     (and
+      <operator-\;>
+      <linebreak>)
+     (and
+      <newline-list>))
+  (:lambda (x) (car x)))
+
+(defmacro rule-alias (to from)
+  `(esrap:defrule ,to ,from (:identity t)))
+
+(rule-alias <and-if> <operator-&&>)
+(rule-alias <open-paren> <operator-\(>)
+(rule-alias <close-paren> <operator-\)>)
+(rule-alias <vbar> <operator-\|>)
+(rule-alias <or-if> <operator-\|\|>)
+
+
+(defun parse-one-command (input &optional (start 0))
+  (multiple-value-bind
+	(parsed next-position)
+      (esrap:parse '<complete-command> input :start start :junk-allowed t)
+    (if parsed
+	(values parsed next-position)
 	(error (make-condition 'posix-parse-failed :format-control "Failed to parse")))))
-	
   
-(defun parse-posix-stuff (input)
-  (let* ((source (make-token-source :parser 'plush-token::posix-token
-				  :input input)))
-    (loop
-       for input  = source then rest
-       for parsed-input = (funcall (<complete-command> nil) input)
-	 for ((result . rest)) = parsed-input
-	 ;do (format *error-output* "~A" parsed-input)
-	 when (not parsed-input)
-	 do (error (make-condition 'posix-parse-failed :format-control "Failed to parse"))
-	 append result
-	 while (not (smug::input-empty-p rest)))))
+(defun parse-posix-stuff (input &optional (start 0))
+  (loop
+     for position  = start then rest
+     for (result rest ) =
+       (multiple-value-list (esrap:parse '<complete-command> input :start position :junk-allowed t))
+					;do (format *error-output* "~A" parsed-input)
+     when (not result)
+     do (error (make-condition 'posix-parse-failed :format-control "Failed to parse"))
+     while (and rest (not (eql (car result) :eof)))
+     append result))
