@@ -356,7 +356,9 @@
    "))")
   (:destructure (start stuff end)
 		(declare (ignore start end))
-    (let* ((expanded
+    (let* ((stuff
+	    (text (mapcar #'second stuff)))
+	   (expanded
 	    (esrap:text
 	     (do-some-expansions
 		 stuff
@@ -737,60 +739,61 @@
     `(:sequence :start-anchor ,@stuff :end-anchor)))
 
 
-#|
-(defun unary-op ()
-  (=let*
-      ((op 
-	(=or
-	 (=char #\+)
-	 (=char #\-)
-	 (=char #\~)
-	 (=char #\!))))
-    (result (make-keyword op))))
+(defrule unary-op
+    (or
+     #\+
+     #\-
+     #\~
+     #\!)
+  (:lambda (x)
+    (make-keyword x)))
+     
+(defrule unary-and-primary-expr
+    (or
+     (and
+      unary-op
+      unary-and-primary-expr)
+     (and
+      primary-expr))
+  (:destructure
+   (first &optional second)
+   (if second
+       (list first second)
+       first)))
 
-(defun unary-and-primary-expr ()
-  (=or
-   (=let*
-       ((unary (unary-op))
-	(more (unary-and-primary-expr)))
-     (result (list unary more)))
-   (primary-expr)))
-
-
-(defun arithmetic-binop ()
-  (=let*
-      ((binop
-	(=or
-	 (=string "<<=")
-	 (=string ">>=")
-	 (=string "&=")
-	 (=string "^=")
-	 (=string "|=")
-	 (=string "<<")
-	 (=string ">>")
-	 (=string "<=")
-	 (=string ">=")
-	 (=string "==")
-	 (=string "!=")
-	 (=string "&&")
-	 (=string "||")
-	 (=string "*=")
-	 (=string "/=")
-	 (=string "%=")
-	 (=string "+=")
-	 (=string "-=")
-	 (=string "=")
-	 (=string "&")
-	 (=string "^")
-	 (=string "|")
-	 (=string "*")
-	 (=string "/")
-	 (=string "%")
-	 (=string "+")
-	 (=string "-")
-	 (=string "<")
-	 (=string ">"))))
-    (result (make-keyword binop))))
+(defrule arithmetic-binop
+    (or
+     "<<="
+     ">>="
+     "&="
+     "^="
+     "|="
+     "<<"
+     ">>"
+     "<="
+     ">="
+     "=="
+     "!="
+     "&&"
+     "||"
+     "*="
+     "/="
+     "%="
+     "+="
+     "-="
+     "="
+     "&"
+     "^"
+     "|"
+     "*"
+     "/"
+     "%"
+     "+"
+     "-"
+     "<"
+     ">")
+  (:lambda (x)
+    (make-keyword x)))
 
 (defun operator-priority (op)
   (case op
@@ -807,88 +810,73 @@
     ((:= :*= :/= :%= :+= :-=
 	 :<<= :>>= :&= :^= :\|=) 11)))
 
-(defun operator-tighter (l r)
-  (< (operator-priority l)
-     (operator-priority r)))
+(defun treeify-expr (list)
+  (if
+   (null (cdr list))
+   (car list)
+   (loop for priority from 11 downto 1
+      for op = (position priority list :key (lambda (x) (and (keywordp x) (operator-priority x))))
+      when op
+      return (list (nth op list)
+		   (treeify-expr (subseq list 0 op))
+		   (treeify-expr (subseq list (1+ op)))))))
 
-(defun unwind-op-stack (op-stack left-stack right &optional until)
-  (loop 
-     for (operator . newop-stack) =  op-stack then newop-stack
-     for (left . newleft-stack) = left-stack then newleft-stack
-     when (and until
-	       (not
-		(operator-tighter operator until)))
-     return (values
-	     right
-	     (cons operator newop-stack)
-	     (cons left newleft-stack))
-     do  (setf right (list operator left right))
-     while newop-stack
-     finally (return (values right nil nil))))
+(defrule arithmetic-expr
+    (and
+     unary-and-primary-expr
+     (*
+      (and
+       arithmetic-binop
+       unary-and-primary-expr)))
+  (:destructure
+   (start pairs)
+   (let
+       ((list
+	 (cons start (reduce #'append pairs))))
+     (treeify-expr list))))
+  
+(defun hex-digit-p (x)
+  (digit-char-p x 16))
 
-(defun continue-binop (op-stack left-stack)
-  (tracer "C-B"
-	  (=let*
-	      ((right (unary-and-primary-expr))
-	       (op (maybe
-		    (arithmetic-binop))))
-	    (multiple-value-bind
-		  (newleft newop-stack newleft-stack)
-		(unwind-op-stack op-stack left-stack right op)
-	      (if op
-		  (continue-binop
-		   (cons op newop-stack)
-		   (cons newleft newleft-stack))
-		  (result newleft))))))
+(defun oct-digit-p (x)
+  (digit-char-p x 8))
 
-(defun arithmetic-expr ()
-  (=let*
-      ((left (unary-and-primary-expr))
-       (op
-	(tracer "op"
-		(maybe
-		 (arithmetic-binop)))))
-    (if (not op)
-	(result left)
-	(continue-binop (list op) (list left)))))
+(defrule literal-number
+    (or
+     (and
+      "0x"
+      (+ (hex-digit-p character)))
+     (and
+      "0"
+      (+ (oct-digit-p character)))
+     (and
+      (+ (digit-char-p character))))
+  (:lambda (x)
+    (list :number
+	  (cond
+	    ((= (length x) 1)
+	     (parse-integer (text (car x))))
+	    ((string= (car x) "0x")
+	     (parse-integer (text (cadr x)) :radix 16))
+	    ((string= (car x) "0")
+	     (parse-integer (text (cadr x)) :radix 8))))))
 
-(defun literal-number ()
-  (=let*
-      ((base-marker
-	(maybe
-	 (string-of
-	  (=or
-	   (=string "0x")
-	   (=prog1
-	    (=string "0")
-	    (=not (=not
-		   (=satisfies
-		    (lambda (x) (digit-char-p x))))))))))
-       (base
-	(cond
-	  ((null base-marker) (result 10))
-	  ((string= base-marker "0") (result 8))
-	  (t (result 16))))
-       (number
-	(string-of
-	 (one-or-more
-	  (=satisfies
-	   (lambda (x) (digit-char-p x  base)))))))
-    (result
-     (list :number
-	   (parse-integer number :radix base)))))
-
-(defun primary-expr ()
-  (=or
-   (=let*
-       ((_ (=char #\())
-	(expr (arithmetic-expr))
-	(_ (=char #\))))
-     (result expr))
-   (=let*
-       ((name (string-of (posix-name))))
-     (result (list :var name)))
-   (literal-number)))
+(defrule primary-expr
+    (or
+     (and
+      #\(
+      arithmetic-expr
+      #\))
+     literal-number
+     posix-name)
+  (:lambda (x)
+    (cond
+      ((stringp x)
+       (list :var x))
+      ((eql (car x) #\()
+       (second x))
+      ((eql (car x) :number)
+       x))))
 
 (defun run-arithmetic (pt)
   (let ((op (car pt))
@@ -899,7 +887,7 @@
       (:var (or
 	     (let*
 		 ((param (plush::get-parameter left))
-		  (parsed (when param (funcall (literal-number) param))))
+		  (parsed (when param (parse 'literal-number param))))
 	       (when parsed
 		 (destructuring-bind ((val . rest)) parsed
 		   (when (emptyp rest) (second val)))))
@@ -994,7 +982,6 @@
        (if (= 0 (run-arithmetic left))
 	   1 0)))))
 
-|#
 (defvar *preserve-words-as-tokens* nil)
 (defvar *alias-stack* nil)
 
