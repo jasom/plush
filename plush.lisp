@@ -57,16 +57,16 @@
 				  ;bg
 				  ("cd" . make-utility)
 				  ;command
-				  ;false
+				  ("false" . make-utility)
 				  ;fc
 				  ;fg
-				  ;getopts
+				  ("getopts" . make-utility)
 				  ("jobs" . make-utility)
 				  ;kill
 				  ;newgrp
 				  ;pwd
 				  ;read
-				  ;true
+				  ("true" . make-utility)
 				  ("umask" . make-utility)
 				  ;unalias
 				  ;wait
@@ -87,6 +87,7 @@
   (aliases (make-hash-table :test #'equal) :type hash-table)
   (last-returnval 0 :type fixnum)
   (last-bg-pid nil :type (or null fixnum))
+  (getopts-offset 0 :type fixnum)
   (bg-jobs (make-hash-table) :type hash-table))
   
 (defparameter *current-shell-environment* (make-shell-environment))
@@ -163,6 +164,99 @@
        do (format t "~A~%" item))
   0)
 
+(defun true-command (ut)
+  (declare (ignore ut))
+  0)
+
+(defun false-command (ut)
+  (declare (ignore ut))
+  1)
+
+(defun getopts-command (ut)
+  (declare (values fixnum))
+  (values
+   (when (null (iolib/os:environment-variable "OPTIND"))
+     (setf (iolib/os:environment-variable "OPTIND") "1"))
+   (destructuring-bind
+	 (_ optstring name &rest args)
+       (command-words ut)
+     (declare (ignore _))
+     (iolib/os:makunbound-environment-variable "OPTARG")
+     (let*
+	 ((args
+	   (or args
+	       (se-numeric-arguments *current-shell-environment*)))
+	  (colon (and (> (length optstring) 0)
+		      (eql (char optstring 0) #\:)))
+	  (optstring (subseq optstring 1))
+	  (optind (1- (parse-integer (get-parameter "OPTIND") :junk-allowed t))))
+
+       
+       (when (= 0 optind)
+	 (setf (se-getopts-offset *current-shell-environment*) 0))
+       (unless (= 0 (se-getopts-offset *current-shell-environment*))
+	 (decf optind))
+       
+       (cond
+	 ((or (null optind)
+	      (< optind 0))
+	  1)
+	 ((>= optind (length args))
+	  2)
+	 ((string= (nth optind args) "--")
+	  (setf (iolib/os:environment-variable "OPTIND") (format nil "~D" (+ 2 optind))
+		(se-getopts-offset *current-shell-environment*) 0)
+	  3)
+	 ((= 0 (se-getopts-offset *current-shell-environment*))
+	  (if (and (> (length (nth optind args)) 0)
+		   (char= #\- (char (nth optind args) 0)))
+	      (progn
+		(incf (se-getopts-offset *current-shell-environment*))
+		(getopts-command ut))
+	      4))
+	 ((>= (se-getopts-offset *current-shell-environment*) (length (nth optind args)))
+	  (setf (iolib/os:environment-variable "OPTIND") (format nil "~D" (+ 2 optind))
+		(se-getopts-offset *current-shell-environment*) 0)
+	  (getopts-command ut))
+	 (t
+	  (let* ((c (char (nth optind args) (se-getopts-offset *current-shell-environment*)))
+		 (found (and (char/= c #\:)
+			     (position c optstring)))
+		 (takes-arg (and
+			     found
+			     (< (1+ found) (length optstring))
+			     (char= (char optstring (1+ found)) #\:))))
+	    (incf (se-getopts-offset *current-shell-environment*))
+	    (setf (iolib/os:environment-variable name) ;We may override this, but it's the common case
+		  c)
+	    (cond
+	      ((and takes-arg
+		    (= (se-getopts-offset *current-shell-environment*)
+		       (length (nth optind args))))
+	       (unless (>= optind (length args))
+		 (setf (iolib/os:environment-variable "OPTARG") (nth (1+ optind) args)
+		       (se-getopts-offset *current-shell-environment*) 0
+		       (iolib/os:environment-variable "OPTIND") (format nil "~D" (+ 2 optind))))
+	       0)
+	      (takes-arg
+	       (setf (iolib/os:environment-variable "OPTARG")
+		     (subseq (nth optind args) (se-getopts-offset *current-shell-environment*))
+		     (se-getopts-offset *current-shell-environment*) (length (nth optind args)))
+	       0)
+	      ((not found)
+	       (setf
+		(iolib/os:environment-variable name) "?")
+	       (if colon
+		   (setf (iolib/os:environment-variable "OPTARG") c)
+		   (format *error-output* "getopts: Unspecified argument '~C' found~%" c))
+	       0)
+	      (t
+	       0)))))))))
+	      
+	      
+
+	
+
 ;TODO assignments and redirects
 (defmethod run-command ((ut utility) &key &allow-other-keys)
   (let ((env (iolib/os:environment)))
@@ -187,8 +281,14 @@
                     (setf iolib/pathnames:*default-file-path-defaults* abspath)
                     0)
                   (iolib/syscalls:enoent (v) (declare (ignore v)) 127))))
+	   (:|false|
+	     (false-command ut))
+	   (:|getopts|
+	     (getopts-command ut))
 	   (:|jobs|
 	     (jobs-command ut))
+	   (:|true|
+	     (true-command ut))
 	   (:|umask|
 	     (umask-command ut))
 	   (:|[|
@@ -551,6 +651,7 @@
 
 ;TODO stub
 (defun init-subshell ()
+  (setf (iolib/os:environment-variable "OPTIND") "1")
   (warn "STUB: init-subshell"))
 
 (defmacro with-subshell ((&optional wait) &body b)
@@ -580,7 +681,7 @@
 (defun reap-children (se)
   (loop for (job-id . pid) in (hash-table-alist (se-bg-jobs se))
      for stat = (and pid (isys:waitpid pid isys:wnohang))
-     if stat
+     if (> stat 0)
      do
        (cond
 	 ((isys:wifexited stat)
