@@ -15,6 +15,20 @@
   arg)
 
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;   newline-skip-list is somewhat confusing                          ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; It is a sorted (further in file closer to head) alist of (POSITION
+;; . SKIP) pairs.  Each time a here-doc redirect is found, it searches
+;; ahead and determines how many characters to skip for the matching
+;; here-doc.  It then adds an entry to the position of the REDIRECT (not
+;; the EOL) to;; that effect.  If the new entry would not go to the head
+;; of the list, then enough of the list is;; discarded so that it goes to
+;; the head (since it means we have backtracked).  Then on the newline we
+;; skip that many characters, and insert an entry for the position of
+;; the newline with a skip of 0.
+;; Any time a new parse is started, *newline-skip-list* should be
+;; bound to (list (cons 0 0)).
 (defparameter *newline-skip-list* (list (cons 0 0)))
 
 (defun update-newline-skip (position value)
@@ -889,8 +903,7 @@
 		 ((param (plush::get-parameter left))
 		  (parsed (when param (parse 'literal-number param))))
 	       (when parsed
-		 (destructuring-bind ((val . rest)) parsed
-		   (when (emptyp rest) (second val)))))
+		 (second parsed)))
 	     0))
       ((:<<= :>>= :&= :^= :\|= :*= :/=
 	     :%= :+= :-=)
@@ -1488,12 +1501,19 @@
 	     (alias (and (not (member (second cmd) *alias-stack* :test #'string=))
 			 (plush::alias-substitute (second cmd)))))
 	(if alias
-	  (let ((backtrack-to start)
+	    (let ((backtrack-to start)
 		  (newline-skip (get-newline-skip-for-position start))
 		  (cmd-start (third cmd))
 		  (cmd-end (fourth cmd)))
 	      (let ((*alias-stack*
-		     (cons (second cmd) *alias-stack*)))
+		     (cons (second cmd) *alias-stack*))
+		    (new-cmd
+		     (concatenate 'string
+				  (subseq input
+					  backtrack-to cmd-start)
+				  alias
+				  (subseq input
+					  cmd-end))))
 		(destructuring-bind
 		      (stuff next &optional (info :not-set)
 			     &aux (success
@@ -1502,18 +1522,13 @@
 		    (let ((*newline-skip-list* (list (cons 0 newline-skip))))
 		      (multiple-value-list
 		       (esrap::parse '<command>
-				     (concatenate 'string
-						  (subseq input
-							  backtrack-to cmd-start)
-						  alias
-						  (subseq input
-							  cmd-end))
+				     new-cmd
 				     :junk-allowed t)))
-		  
 		  (if success
-		      (values stuff
-			      (- (+ next backtrack-to (- cmd-end cmd-start)) (length alias))
-			      t)
+		      (let ((next (or next (length new-cmd))))
+			(values stuff
+				(- (+ next backtrack-to (- cmd-end cmd-start)) (length alias))
+				t))
 		      (values nil 0)))))
 	  (values nil start)))
       (values nil start))))
