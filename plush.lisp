@@ -792,7 +792,6 @@
   (esrap::parse (if vas
 		    'plush-parser::expand-word-parser-assignment
 		    'plush-parser::expand-word-parser) word))
-  ;(smug:run (plush-parser::expand-word-parser vas) word))
 
 (defun expand-here-doc (doc)
   (apply 'concatenate 'string

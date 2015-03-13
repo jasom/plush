@@ -7,7 +7,6 @@
   :license "MIT"
   :depends-on (#:alexandria
 	       #:esrap
-               #:smug
 	       #:cl-ppcre
                #:split-sequence
                #:iolib/syscalls

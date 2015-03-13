@@ -1058,54 +1058,6 @@
   parser)
      
 
-;This needs to be line cached because our
-;Tokenizer includes side-effects that disallows backtracking within a line
-(defstruct token-source
-  (parser nil :type symbol)
-  (line-cache nil :type list)
-  (input "")
-  (position 0))
-
-(defun line-cache-fill (input)
-  (when (null (token-source-line-cache input))
-    ;(print input)
-    (setf (token-source-line-cache input)
-	  (loop
-	     for (result newstart success) =
-	       (multiple-value-list (esrap:parse (token-source-parser input) (token-source-input input)
-						 :junk-allowed t :start (token-source-position input)))
-	     then
-	       (multiple-value-list (esrap:parse (token-source-parser input) (token-source-input input)
-						 :start (or newstart (length (token-source-input input))) :junk-allowed t))
-	     collect result
-	       ;do (print result)
-	     while (and
-		    (not (eql (car result) :eof))
-		    (not (eql (car result) :newline)))
-	     finally (setf (token-source-position input)
-			   (or newstart (length (token-source-input input)))))))
-  ;(print input)
-  (token-source-line-cache input))
-
-(defmethod smug::input-first ((input token-source))
-  (let
-      ((line-cache (line-cache-fill input)))
-    (car line-cache)))
-
-(defmethod smug::input-rest ((input token-source))
-  (let
-      ((line-cache (line-cache-fill input)))
-    (make-token-source
-     :parser (token-source-parser input)
-     :line-cache (cdr line-cache)
-     :input (token-source-input input)
-     :position (token-source-position input))))
-
-(defmethod smug::input-empty-p ((input token-source))
-  (let
-      ((line-cache (line-cache-fill input)))
-  (eql :eof (caar line-cache))))
-
 (defun convert-maybe-async-list (list)
   (loop for (cmd op . rest) = list then rest
        while cmd
@@ -1467,10 +1419,6 @@
      <compound-list>
      <rword-done>)
   (:function second))
-
-;;BUG TODO UGLY DAMNIT POSIX
-;;This can backtrack, potentially across a HERE-DOC
-;;That breaks my ugly hack for newline-skip :(
 
 (defun not-null (x)
   (not (null x)))
